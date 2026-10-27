@@ -1,0 +1,12 @@
+Kotensor Context/
+.gradle/
+**/build/
+!**/gradle/wrapper/gradle-wrapper.jar
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.vscode/
+.DS_Store
+Thumbs.db
