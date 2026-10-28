@@ -1,5 +1,7 @@
 package io.kotensor.core
 
+import kotlin.math.pow
+
 class Tensor (
     val data: FloatArray,
     val shape: IntArray,
@@ -67,29 +69,29 @@ class Tensor (
         val outShape = intArrayOf(m, n)
         val outData = FloatArray(m * n)
 
+        for (i in 0 until m) {
+            for (j in 0 until n) {
+                var sum = 0.0f
+                for (l in 0 until k) {
+                    sum += this.data[i * k + l] * other.data[l * n + j]
+                }
+                outData[i * n + j] = sum
+            }
+        }
+
+        lateinit var out: Tensor
+        out = Tensor(outData, outShape, listOf(this, other)) {
             for (i in 0 until m) {
                 for (j in 0 until n) {
-                    var sum = 0.0f
+                    val outGrad = out.grad[i * n + j]
                     for (l in 0 until k) {
-                        sum += this.data[i * k + l] * other.data[l * n + j]
-                    }
-                    outData[i * n + j] = sum
-                }
-            }
-
-            lateinit var out: Tensor
-            out = Tensor(outData, outShape, listOf(this, other)) {
-                for (i in 0 until m) {
-                    for (j in 0 until n) {
-                        val outGrad = out.grad[i * n + j]
-                        for (l in 0 until k) {
-                            this.grad[i * k + l] += outGrad * other.data[l * n + j]
-                            other.grad[l * n + j] += outGrad * this.data[i * k + l]
-                        }
+                        this.grad[i * k + l] += outGrad * other.data[l * n + j]
+                        other.grad[l * n + j] += outGrad * this.data[i * k + l]
                     }
                 }
             }
-            return out
+        }
+        return out
     }
 
     fun reshape(newShape: IntArray): Tensor {
@@ -124,7 +126,7 @@ class Tensor (
                 }
             }
         }
-        return out  
+        return out
     }
 
     fun backward(){
@@ -143,5 +145,63 @@ class Tensor (
         for(node in topology.asReversed()){
             node.backwardOp()
         }
+    }
+
+    fun relu(): Tensor{
+        val outData = FloatArray(data.size){i -> if(data[i] > 0f) data[i] else 0f}
+        lateinit var out: Tensor
+        out = Tensor(outData, shape, listOf(this)){
+            for(i in data.indices){
+                if(data[i] > 0f){
+                    this.grad[i] += out.grad[i]
+                }
+            }
+        }
+        return out
+    }
+
+    fun silu(): Tensor{
+        val outData = FloatArray(data.size)
+        val sigmoids = FloatArray(data.size)
+        for(i in data.indices){
+            val x = data[i]
+            val s = 1.0f / (1.0f + kotlin.math.exp(-x))
+            sigmoids[i] = s
+            outData[i] = x * s
+        }
+        lateinit var out: Tensor
+        out = Tensor(outData, shape, listOf(this)){
+            for(i in data.indices){
+                val s = sigmoids[i]
+                val rate = s * (1.0f + data[i] * (1.0f - s))
+                this.grad[i] += out.grad[i] * rate
+            }
+        }
+        return out
+    }
+
+    fun gelu(): Tensor{
+        val constant = 0.79788456f
+        val outData = FloatArray(data.size)
+        val tanhValues = FloatArray(data.size)
+        for(i in data.indices){
+            val x = data[i]
+            val inner = constant * (x + 0.044715f * x * x * x)
+            val t = kotlin.math.tanh(inner)
+            tanhValues[i] = t
+            outData[i] = 0.5f * x * (1.0f + t)
+        }
+        lateinit var out: Tensor
+        out = Tensor(outData, shape, listOf(this)){
+            for(i in data.indices){
+                val x = data[i]
+                val t = tanhValues[i]
+                val sech2 = 1.0f - t * t
+                val dInner = constant * (1.0f + 3.0f * 0.044715f * x * x)
+                val rate = 0.5f * (1.0f + t) + 0.5f * x * sech2 * dInner
+                this.grad[i] += out.grad[i] * rate
+            }
+        }
+        return out
     }
 }
