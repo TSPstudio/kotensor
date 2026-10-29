@@ -20,17 +20,68 @@ class Tensor (
         }
     }
 
-    operator fun plus(other: Tensor): Tensor{
-        require(this.shape.contentEquals(other.shape))
-        val outData = FloatArray(data.size) { i -> data[i] + other.data[i] }
-        lateinit var out: Tensor
-        out = Tensor(outData,shape,listOf(this, other)){
-            for(i in data.indices){
-                this.grad[i] += out.grad[i]
-                other.grad[i] += out.grad[i]
+    operator fun plus(other: Tensor): Tensor {
+        if (this.shape.contentEquals(other.shape)) {
+            val outData = FloatArray(data.size) { i -> data[i] + other.data[i] }
+            lateinit var out: Tensor
+            out = Tensor(outData, shape, listOf(this, other)) {
+                for (i in data.indices) {
+                    this.grad[i] += out.grad[i]
+                    other.grad[i] += out.grad[i]
+                }
+            }
+            return out
+        }
+
+        if (this.shape.size == 2 && other.shape.size == 2 && this.shape[1] == other.shape[1]) {
+            if (other.shape[0] == 1) {
+                val rows = this.shape[0]
+                val cols = this.shape[1]
+                val outData = FloatArray(data.size)
+                for (r in 0 until rows) {
+                    val rowOffset = r * cols
+                    for (c in 0 until cols) {
+                        outData[rowOffset + c] = this.data[rowOffset + c] + other.data[c]
+                    }
+                }
+                lateinit var out: Tensor
+                out = Tensor(outData, this.shape.copyOf(), listOf(this, other)) {
+                    for (r in 0 until rows) {
+                        val rowOffset = r * cols
+                        for (c in 0 until cols) {
+                            val g = out.grad[rowOffset + c]
+                            this.grad[rowOffset + c] += g
+                            other.grad[c] += g
+                        }
+                    }
+                }
+                return out
+            } else if (this.shape[0] == 1) {
+                val rows = other.shape[0]
+                val cols = other.shape[1]
+                val outData = FloatArray(other.data.size)
+                for (r in 0 until rows) {
+                    val rowOffset = r * cols
+                    for (c in 0 until cols) {
+                        outData[rowOffset + c] = this.data[c] + other.data[rowOffset + c]
+                    }
+                }
+                lateinit var out: Tensor
+                out = Tensor(outData, other.shape.copyOf(), listOf(this, other)) {
+                    for (r in 0 until rows) {
+                        val rowOffset = r * cols
+                        for (c in 0 until cols) {
+                            val g = out.grad[rowOffset + c]
+                            this.grad[c] += g
+                            other.grad[rowOffset + c] += g
+                        }
+                    }
+                }
+                return out
             }
         }
-        return out
+
+        throw IllegalArgumentException("Shape mismatch: ${this.shape.contentToString()} and ${other.shape.contentToString()}")
     }
 
     operator fun minus(other: Tensor):Tensor{
@@ -54,6 +105,17 @@ class Tensor (
             for(i in data.indices){
                 this.grad[i] += out.grad[i] * other.data[i]
                 other.grad[i] += out.grad[i] * this.data[i]
+            }
+        }
+        return out
+    }
+
+    operator fun times(scalar: Float): Tensor {
+        val outData = FloatArray(data.size) { i -> data[i] * scalar }
+        lateinit var out: Tensor
+        out = Tensor(outData, shape.copyOf(), listOf(this)) {
+            for (i in data.indices) {
+                this.grad[i] += out.grad[i] * scalar
             }
         }
         return out

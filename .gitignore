@@ -10,3 +10,7 @@ out/
 .vscode/
 .DS_Store
 Thumbs.db
+*.safetensors
+*.bin
+*.pt
+.kotlin/
