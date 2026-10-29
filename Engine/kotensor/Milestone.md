@@ -38,12 +38,12 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
 - Fixed on the way: `RoPE` rotated each head slice as if it were its own token (positions depended on the head index and on the total sequence length), which is incompatible with caching; it now rotates every head of a token with the token's position.
 
 #### 1. Key-Value (KV) Caching
-* **Files:** [`Attention.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Attention.kt), [`TransformerBlock.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/TransformerBlock.kt), [`Transformer.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Transformer.kt)
+* **Files:** [`Attention.kt`](src/main/kotlin/Attention.kt), [`TransformerBlock.kt`](src/main/kotlin/TransformerBlock.kt), [`Transformer.kt`](src/main/kotlin/Transformer.kt)
 * **Problem:** Generating token $t$ currently re-computes attention over all previous $1 \dots t-1$ tokens, scaling total generation time to $O(T^2)$.
 * **Technical Specification:**
   - Create `KVCache` holding pre-allocated flat `FloatArray` buffers for keys and values across all layers:
     $$\text{Shape: } [\text{layers}, \text{heads}, \text{maxSeqLen}, \text{headDim}]$$
-  - Add decode-mode flag to [`Attention.forward`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Attention.kt):
+  - Add decode-mode flag to [`Attention.forward`](src/main/kotlin/Attention.kt):
     - When `step > 0`, input token length is $T = 1$.
     - Compute $Q$ for the current single token.
     - Compute $K_{\text{new}}$ and $V_{\text{new}}$ for the single token and write into `KVCache` at position `step`.
@@ -51,8 +51,8 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
   - Reduces per-token generation step to $O(1)$ time complexity relative to sequence position.
 
 #### 2. Byte-Pair Encoding (BPE) Tokenizer
-* **Files:** [`Tokenizer.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Tokenizer.kt)
-* **Problem:** Character-level [`SimpleTokenizer`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Tokenizer.kt) cannot load real pre-trained weights or handle natural language vocabularies (e.g. LLaMA, Qwen, SmolLM).
+* **Files:** [`Tokenizer.kt`](src/main/kotlin/Tokenizer.kt)
+* **Problem:** Character-level [`SimpleTokenizer`](src/main/kotlin/Tokenizer.kt) cannot load real pre-trained weights or handle natural language vocabularies (e.g. LLaMA, Qwen, SmolLM).
 * **Technical Specification:**
   - Implement `BPETokenizer : Tokenizer` with zero external JSON libraries:
     - Lightweight, zero-dependency parser for Hugging Face `tokenizer.json`.
@@ -73,7 +73,7 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
 - Result on the same 2-core container as the kernel benchmarks: a dim-64 / 4-layer model streams 3.7 k tokens/s (1.0 k before this milestone), a dim-256 / 8-layer / 8 k-vocab model 91 tokens/s (27 before), and SmolLM-135M-shaped weights (30 layers, dim 576, vocab 49 k, 176 M parameters in FP32) 10.9 tokens/s, memory-bandwidth bound.
 
 #### 1. Multi-Threaded Tiled Matrix Multiplication
-* **Files:** [`Tensor.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Tensor.kt)
+* **Files:** [`Tensor.kt`](src/main/kotlin/Tensor.kt)
 * **Problem:** Naive $O(n^3)$ triple loop runs single-threaded, ignoring multi-core CPUs and CPU L1/L2 cache lines.
 * **Technical Specification:**
   - **Cache Tiling / Blocking:** Partition matrices $A [M, K]$ and $B [K, N]$ into cache-friendly blocks ($B_M \times B_K \times B_N$) fitting in L1/L2 cache lines ($32 \times 32$ or $64 \times 64$).
@@ -81,7 +81,7 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
   - **Loop Unrolling & Register Accumulation:** Inner dot-products unrolled by 4 or 8 accumulators to maximize instruction-level parallelism (ILP).
 
 #### 2. Zero-Allocation Inference Engine
-* **Files:** [`Tensor.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Tensor.kt), [`Transformer.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Transformer.kt)
+* **Files:** [`Tensor.kt`](src/main/kotlin/Tensor.kt), [`Transformer.kt`](src/main/kotlin/Transformer.kt)
 * **Problem:** Frequent allocation of intermediate `FloatArray` instances during autoregressive generation triggers JVM Garbage Collection pauses.
 * **Technical Specification:**
   - Implement static activation buffers and in-place ops (`matmulInto`, `addInto`, `siluInPlace`) reserved for inference loops.
@@ -101,14 +101,14 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
 - Not supported (rejected with a clear message rather than silently wrong): other `model_type`s (Gemma's `1 + w` norm, Phi-3's fused QKV, Qwen3's q/k norms), `rope_scaling` types other than `llama3`, `head_dim ≠ hidden_size / num_attention_heads`.
 
 #### 1. Grouped-Query Attention (GQA) & Multi-Query Attention (MQA)
-* **Files:** [`Attention.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Attention.kt)
+* **Files:** [`Attention.kt`](src/main/kotlin/Attention.kt)
 * **Problem:** Modern models (Llama 3, SmolLM, Qwen 2.5) use $N_{KV} < N_Q$ to reduce KV cache size.
 * **Technical Specification:**
-  - Add parameter `numKeyValueHeads: Int` to [`Attention`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/Attention.kt).
+  - Add parameter `numKeyValueHeads: Int` to [`Attention`](src/main/kotlin/Attention.kt).
   - Broadcast KV heads across query groups during dot-product attention calculation.
 
 #### 2. Automated Hugging Face Config & Weight Importer
-* **Files:** New `HuggingFaceModelLoader.kt`, [`SafeTensors.kt`](file:///c:/Users/Dell/Desktop/Kotensor/Engine/kotensor/src/main/kotlin/SafeTensors.kt)
+* **Files:** New `HuggingFaceModelLoader.kt`, [`SafeTensors.kt`](src/main/kotlin/SafeTensors.kt)
 * **Technical Specification:**
   - Minimal JSON parser for `config.json` extracting:
     `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `rms_norm_eps`, `rope_theta`.

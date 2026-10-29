@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/kotensor-logo-dark.png">
-    <img src="assets/kotensor-logo.png" alt="Kotensor" width="440">
+    <source media="(prefers-color-scheme: dark)" srcset="../../assets/kotensor-logo-dark.png">
+    <img src="../../assets/kotensor-logo.png" alt="Kotensor" width="440">
   </picture>
 </p>
 
@@ -816,7 +816,7 @@ The five planned layers are implemented, and so are all five milestones of [`Mil
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](LICENSE).
+Apache License 2.0 — see [`LICENSE`](../../LICENSE).
 
 <p align="center">
   <sub>Built in Kotlin, from the tensor up.</sub>
