@@ -7,6 +7,8 @@ plugins {
     kotlin("jvm") version "2.3.20"
     id("org.jetbrains.dokka") version "2.2.0"
     id("com.vanniktech.maven.publish") version "0.37.0"
+    id("com.android.application") version "9.0.1" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.3.20" apply false
 }
 
 group = "io.github.tspstudio"
