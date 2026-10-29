@@ -77,13 +77,30 @@ class LoRAAdapter(
         return params
     }
 
+    /**
+     * Folds each adapter's delta into its base Linear weights and puts the plain Linear
+     * layers back into the model, so the adaptation is applied exactly once. After merging,
+     * the model is a regular Transformer again and this adapter has no layers left.
+     */
     fun merge() {
-        for (layer in layers.values) {
+        val merged = layers.values.toSet()
+        for (layer in merged) {
             val delta = layer.deltaWeights()
             for (i in layer.baseLinear.weight.data.indices) {
                 layer.baseLinear.weight.data[i] += delta.data[i]
             }
         }
+        for (block in model.blocks) {
+            val q = block.attention.wQ
+            if (q is LoRALinear && q in merged) {
+                block.attention.wQ = q.baseLinear
+            }
+            val v = block.attention.wV
+            if (v is LoRALinear && v in merged) {
+                block.attention.wV = v.baseLinear
+            }
+        }
+        layers.clear()
     }
 
     fun saveDelta(file: File) {

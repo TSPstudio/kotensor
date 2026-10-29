@@ -10,9 +10,15 @@ class TransformerBlock(
     val norm2 = RMSNorm(dimension)
     val ffn = SwiGLU(dimension, hiddenDimension)
 
+    /** Treats the whole input (tokens × dimension) as a single sequence. */
     override fun forward(input: Tensor): Tensor {
+        return forward(input, input.data.size / dimension)
+    }
+
+    /** Processes (batch × sequenceLength) tokens as independent sequences of [sequenceLength]. */
+    fun forward(input: Tensor, sequenceLength: Int): Tensor {
         val normed1 = norm1(input)
-        val attnOut = attention(normed1)
+        val attnOut = attention.forward(normed1, sequenceLength)
         val res1 = input + attnOut
         val normed2 = norm2(res1)
         val ffnOut = ffn(normed2)

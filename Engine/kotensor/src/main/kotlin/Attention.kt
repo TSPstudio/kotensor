@@ -20,17 +20,31 @@ class Attention(
         require(dimension % numHeads == 0) { "dimension must be divisible by numHeads" }
     }
 
+    /** Treats the whole input (tokens × dimension) as a single sequence. */
     override fun forward(input: Tensor): Tensor {
+        return forward(input, input.data.size / dimension)
+    }
+
+    /**
+     * Causal self-attention over an input of (batch × sequenceLength) tokens.
+     * Each consecutive run of [sequenceLength] tokens is an independent sequence:
+     * tokens only attend to earlier tokens of their own sequence, and rotary
+     * positions restart at 0 for every sequence.
+     */
+    fun forward(input: Tensor, sequenceLength: Int): Tensor {
         val totalElements = input.data.size
-        require(totalElements % dimension == 0)
+        require(totalElements % dimension == 0) { "Input elements $totalElements not divisible by dimension $dimension" }
         val tokens = totalElements / dimension
+        require(sequenceLength > 0 && tokens % sequenceLength == 0) {
+            "Token count $tokens must be a positive multiple of sequenceLength $sequenceLength"
+        }
 
         val qProj = wQ(input)
         val kProj = wK(input)
         val vProj = wV(input)
 
-        val qRoPE = rope.apply(qProj)
-        val kRoPE = rope.apply(kProj)
+        val qRoPE = rope.apply(qProj, 0, sequenceLength)
+        val kRoPE = rope.apply(kProj, 0, sequenceLength)
 
         val attnScores = FloatArray(numHeads * tokens * tokens)
         val attnWeights = FloatArray(numHeads * tokens * tokens)
@@ -42,9 +56,10 @@ class Attention(
 
             for (i in 0 until tokens) {
                 val rowOffset = matrixOffset + i * tokens
+                val seqStart = (i / sequenceLength) * sequenceLength
                 var maxScore = -1e9f
 
-                for (j in 0..i) {
+                for (j in seqStart..i) {
                     var dot = 0.0f
                     for (d in 0 until headDim) {
                         val qVal = qRoPE.data[i * dimension + headOffset + d]
@@ -59,19 +74,19 @@ class Attention(
                 }
 
                 var sumExp = 0.0f
-                for (j in 0..i) {
+                for (j in seqStart..i) {
                     val expVal = exp(attnScores[rowOffset + j] - maxScore)
                     attnWeights[rowOffset + j] = expVal
                     sumExp += expVal
                 }
 
-                for (j in 0..i) {
+                for (j in seqStart..i) {
                     attnWeights[rowOffset + j] /= sumExp
                 }
 
                 for (d in 0 until headDim) {
                     var outVal = 0.0f
-                    for (j in 0..i) {
+                    for (j in seqStart..i) {
                         val w = attnWeights[rowOffset + j]
                         val vVal = vProj.data[j * dimension + headOffset + d]
                         outVal += w * vVal
@@ -84,7 +99,6 @@ class Attention(
         lateinit var context: Tensor
         context = Tensor(contextData, intArrayOf(tokens, dimension), listOf(qRoPE, kRoPE, vProj)) {
             val dAttnWeights = FloatArray(numHeads * tokens * tokens)
-            val dScores = FloatArray(numHeads * tokens * tokens)
 
             for (h in 0 until numHeads) {
                 val headOffset = h * headDim
@@ -92,8 +106,9 @@ class Attention(
 
                 for (i in 0 until tokens) {
                     val rowOffset = matrixOffset + i * tokens
+                    val seqStart = (i / sequenceLength) * sequenceLength
 
-                    for (j in 0..i) {
+                    for (j in seqStart..i) {
                         var dWeight = 0.0f
                         for (d in 0 until headDim) {
                             val dOut = context.grad[i * dimension + headOffset + d]
@@ -105,14 +120,12 @@ class Attention(
                     }
 
                     var sumDWeightWeight = 0.0f
-                    for (j in 0..i) {
+                    for (j in seqStart..i) {
                         sumDWeightWeight += dAttnWeights[rowOffset + j] * attnWeights[rowOffset + j]
                     }
 
-                    for (j in 0..i) {
+                    for (j in seqStart..i) {
                         val dScore = attnWeights[rowOffset + j] * (dAttnWeights[rowOffset + j] - sumDWeightWeight)
-                        dScores[rowOffset + j] = dScore
-
                         val scaledDScore = dScore * scale
                         for (d in 0 until headDim) {
                             val qVal = qRoPE.data[i * dimension + headOffset + d]

@@ -12,10 +12,17 @@ class RoPE(
         require(dimension % 2 == 0) { "RoPE dimension must be even" }
     }
 
-    fun apply(input: Tensor, startPosition: Int = 0): Tensor {
+    /**
+     * Rotates each token by its position. With [sequenceLength] set, the input is read as
+     * consecutive sequences of that length and positions restart at [startPosition] for each one;
+     * by default the whole input is a single sequence.
+     */
+    fun apply(input: Tensor, startPosition: Int = 0, sequenceLength: Int? = null): Tensor {
         val totalElements = input.data.size
         require(totalElements % dimension == 0) { "Input elements not divisible by dimension" }
         val tokens = totalElements / dimension
+        val seqLen = sequenceLength ?: tokens
+        require(seqLen > 0 && tokens % seqLen == 0) { "Token count $tokens must be a positive multiple of sequenceLength $seqLen" }
         val halfDim = dimension / 2
 
         val outData = FloatArray(totalElements)
@@ -23,7 +30,7 @@ class RoPE(
         val sinValues = FloatArray(tokens * halfDim)
 
         for (t in 0 until tokens) {
-            val position = startPosition + t
+            val position = startPosition + (t % seqLen)
             val tokenOffset = t * dimension
             val cacheOffset = t * halfDim
 

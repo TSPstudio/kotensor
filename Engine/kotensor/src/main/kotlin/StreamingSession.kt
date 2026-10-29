@@ -12,6 +12,7 @@ class StreamingSession(
     val model: Transformer,
     val tokenizer: Tokenizer
 ) {
+    @Volatile
     private var isCancelled = false
 
     fun cancel() {

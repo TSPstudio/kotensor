@@ -14,7 +14,20 @@ class FineTuningPipeline(
         loss.backward()
         optimizer.step()
         optimizer.zeroGrad()
+        clearFrozenGradients()
         return loss.data[0]
+    }
+
+    /** The optimizer only owns the adapter tensors; clear the gradients backward() left on the frozen weights. */
+    private fun clearFrozenGradients() {
+        for (p in model.parameters()) {
+            p.grad.fill(0.0f)
+        }
+        for (layer in adapter.layers.values) {
+            for (p in layer.baseLinear.parameters()) {
+                p.grad.fill(0.0f)
+            }
+        }
     }
 
     fun train(

@@ -14,19 +14,30 @@ class Transformer(
     val finalNorm = RMSNorm(dimension)
     val lmHead = Linear(dimension, vocabularySize)
 
+    /**
+     * Token IDs as a tensor. A 2-D input is read as [batch, sequenceLength] (the shape
+     * DataLoader produces) and each row is an independent sequence; any other shape is
+     * treated as one sequence. Returns logits shaped [batch × sequenceLength, vocabularySize].
+     */
     override fun forward(input: Tensor): Tensor {
-        var x = embedding(input)
-        for (block in blocks) {
-            x = block(x)
-        }
-        val normed = finalNorm(x)
-        return lmHead(normed)
+        val sequenceLength = if (input.shape.size == 2) input.shape[1] else input.data.size
+        return forward(input, sequenceLength)
     }
 
+    /** Token IDs as a tensor, split into independent sequences of [sequenceLength] tokens. */
+    fun forward(input: Tensor, sequenceLength: Int): Tensor {
+        return forwardEmbedded(embedding(input), sequenceLength)
+    }
+
+    /** A single sequence of token IDs. Returns logits shaped [indices.size, vocabularySize]. */
     fun forward(indices: IntArray): Tensor {
-        var x = embedding.forward(indices)
+        return forwardEmbedded(embedding.forward(indices), indices.size)
+    }
+
+    private fun forwardEmbedded(embedded: Tensor, sequenceLength: Int): Tensor {
+        var x = embedded
         for (block in blocks) {
-            x = block(x)
+            x = block.forward(x, sequenceLength)
         }
         val normed = finalNorm(x)
         return lmHead(normed)
@@ -106,23 +117,23 @@ class Transformer(
         for (l in blocks.indices) {
             val b = blocks[l]
             result["block.$l.norm1.weight"] = b.norm1.weight
-            val q = b.attention.wQ
-            if (q is Linear) {
+            val q = baseLinearOf(b.attention.wQ)
+            if (q != null) {
                 result["block.$l.attention.wQ.weight"] = q.weight
                 result["block.$l.attention.wQ.bias"] = q.bias
             }
-            val k = b.attention.wK
-            if (k is Linear) {
+            val k = baseLinearOf(b.attention.wK)
+            if (k != null) {
                 result["block.$l.attention.wK.weight"] = k.weight
                 result["block.$l.attention.wK.bias"] = k.bias
             }
-            val v = b.attention.wV
-            if (v is Linear) {
+            val v = baseLinearOf(b.attention.wV)
+            if (v != null) {
                 result["block.$l.attention.wV.weight"] = v.weight
                 result["block.$l.attention.wV.bias"] = v.bias
             }
-            val o = b.attention.wOut
-            if (o is Linear) {
+            val o = baseLinearOf(b.attention.wOut)
+            if (o != null) {
                 result["block.$l.attention.wOut.weight"] = o.weight
                 result["block.$l.attention.wOut.bias"] = o.bias
             }
@@ -139,6 +150,13 @@ class Transformer(
         result["lmHead.weight"] = lmHead.weight
         result["lmHead.bias"] = lmHead.bias
         return result
+    }
+
+    /** The underlying Linear of a projection, looking through a LoRA wrapper (whose A/B matrices are saved separately). */
+    private fun baseLinearOf(module: Module): Linear? = when (module) {
+        is Linear -> module
+        is LoRALinear -> module.baseLinear
+        else -> null
     }
 
     fun loadParameters(weights: Map<String, Tensor>) {

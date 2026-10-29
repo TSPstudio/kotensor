@@ -1,0 +1,6 @@
+jdk:
+  - openjdk21
+before_install:
+  - cd Engine/kotensor
+install:
+  - ./gradlew publishToMavenLocal
