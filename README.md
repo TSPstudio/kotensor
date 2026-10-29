@@ -14,6 +14,8 @@
   <img alt="Kotlin 2.3.20" src="https://img.shields.io/badge/Kotlin-2.3.20-364FC7?style=flat-square&logo=kotlin&logoColor=white">
   <img alt="JVM 17+" src="https://img.shields.io/badge/JVM-17%2B-16151C?style=flat-square">
   <img alt="Android API 26+" src="https://img.shields.io/badge/Android-API%2026%2B-364FC7?style=flat-square&logo=android&logoColor=white">
+  <a href="https://central.sonatype.com/artifact/io.github.tspstudio/kotensor"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/io.github.tspstudio/kotensor?style=flat-square&color=364FC7"></a>
+  <a href="https://tspstudio.github.io/kotensor/"><img alt="API docs" src="https://img.shields.io/badge/docs-API-16151C?style=flat-square"></a>
   <img alt="Tests: 66 passing" src="https://img.shields.io/badge/tests-66%20passing-16151C?style=flat-square">
   <img alt="Runtime dependencies: Kotlin stdlib only" src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-364FC7?style=flat-square">
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-16151C?style=flat-square">
@@ -78,7 +80,7 @@ Kotensor implements the whole stack — tensors, reverse-mode autograd, optimize
 > **Requirements:** Java 17 or newer. The library is compiled to Java 17 bytecode against the Java 17 API (it is built with a Java 21 toolchain), and its only runtime dependency is the Kotlin standard library.
 > **Android:** API 26 (Android 8.0) and newer. There are no native libraries, so there is no ABI split; [`:sample-android`](#android-sample) is a working Compose app built on it.
 
-The coordinates are `io.github.tspstudio:kotensor:1.0.0` on Maven Central, available once the first release has been published (see [Releasing to Maven Central](#releasing-to-maven-central)). Until then, use the local JAR or `publishToMavenLocal` below.
+Kotensor is published on [Maven Central](https://central.sonatype.com/artifact/io.github.tspstudio/kotensor) as `io.github.tspstudio:kotensor:1.0.0`. The API reference is at [tspstudio.github.io/kotensor](https://tspstudio.github.io/kotensor/).
 
 ### Gradle (Kotlin DSL)
 
@@ -110,7 +112,7 @@ dependencies {
 
 Then add `mavenLocal()` to the consuming project's repositories. No signing keys are needed for local publishing.
 
-### Local JAR (before a release is published)
+### Local JAR
 
 ```bash
 cd Engine/kotensor
@@ -701,6 +703,8 @@ java -jar benchmark/build/libs/benchmark-1.0.0-jmh.jar DecodeBenchmark -p weight
 Every run uses the `gc` profiler, so the results include `gc.alloc.rate.norm` — bytes allocated per operation — next to the throughput.
 
 ## API documentation
+
+The published reference is at **[tspstudio.github.io/kotensor](https://tspstudio.github.io/kotensor/)**. To build it locally:
 
 ```bash
 ./gradlew dokkaGenerate        # → build/dokka/html/index.html
