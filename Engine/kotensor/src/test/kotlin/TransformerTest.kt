@@ -86,3 +86,4 @@ class TransformerTest {
         assertEquals(6, generated.length)
     }
 }
+

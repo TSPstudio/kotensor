@@ -6,6 +6,33 @@ interface Tokenizer {
     fun decode(tokens: IntArray): String
 }
 
+class IncrementalDecoder(val tokenizer: Tokenizer) {
+    private val pending = mutableListOf<Int>()
+
+    fun push(token: Int): String {
+        pending.add(token)
+        val text = tokenizer.decode(pending.toIntArray())
+        if (text.endsWith(REPLACEMENT_CHAR) && pending.size < MAX_PENDING) {
+            return ""
+        }
+        pending.clear()
+        return text
+    }
+
+    fun flush(): String {
+        if (pending.isEmpty()) return ""
+        val text = tokenizer.decode(pending.toIntArray())
+        pending.clear()
+        return text
+    }
+
+    private companion object {
+        const val REPLACEMENT_CHAR = '�'
+
+        const val MAX_PENDING = 4
+    }
+}
+
 class SimpleTokenizer(
     val textBody: String
 ) : Tokenizer {
@@ -40,3 +67,4 @@ class SimpleTokenizer(
         return sb.toString()
     }
 }
+

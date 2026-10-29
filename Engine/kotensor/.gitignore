@@ -1,11 +1,17 @@
 .gradle
 build/
 *.safetensors
+!src/test/resources/**/*.safetensors
 *.bin
 *.pt
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/
+
+### Android ###
+local.properties
+*.apk
+*.aab
 
 ### IntelliJ IDEA ###
 .idea/modules.xml

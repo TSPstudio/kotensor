@@ -93,3 +93,4 @@ fun crossEntropyLoss(logits: Tensor, targets: Tensor): Tensor {
     val targetIndices = IntArray(targets.data.size) { i -> targets.data[i].toInt() }
     return crossEntropyLoss(logits, targetIndices)
 }
+

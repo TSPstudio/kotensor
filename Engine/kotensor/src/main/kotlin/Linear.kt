@@ -3,12 +3,19 @@ package io.kotensor.core
 import kotlin.math.sqrt
 import kotlin.random.Random
 
-class Linear(
+abstract class Projection(
     val inSize: Int,
     val outSize: Int
-): Module(){
+) : Module() {
+    abstract val bias: Tensor
+}
+
+class Linear(
+    inSize: Int,
+    outSize: Int
+): Projection(inSize, outSize) {
     val weight: Tensor
-    val bias: Tensor
+    override val bias: Tensor
 
     init{
     val scale = sqrt(2.0f/(inSize + outSize))
@@ -24,9 +31,14 @@ class Linear(
         return(input matmul weight) + bias
     }
 
+    override fun forwardInto(input: Tensor, out: Tensor): Tensor {
+        input.matmulInto(weight, out)
+        return out.addInPlace(bias)
+    }
+
     override fun parameters(): List<Tensor> {
         return listOf(weight, bias)
     }
 
-
 }
+

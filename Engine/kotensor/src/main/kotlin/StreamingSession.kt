@@ -22,6 +22,7 @@ class StreamingSession(
     fun stream(
         prompt: String,
         maxTokens: Int,
+        stopTokens: Set<Int> = emptySet(),
         onUpdate: (GenerationState) -> Unit
     ): GenerationState {
         isCancelled = false
@@ -32,11 +33,11 @@ class StreamingSession(
         onUpdate(GenerationState(prompt = prompt, generatedText = "", isGenerating = true, tokensGenerated = 0, tokensPerSecond = 0.0f))
 
         val encoded = tokenizer.encode(prompt)
-        for (token in model.generateStream(encoded, maxTokens)) {
+        val decoder = IncrementalDecoder(tokenizer)
+        for (token in model.generateStream(encoded, maxTokens, stopTokens)) {
             if (isCancelled) break
 
-            val char = tokenizer.decode(intArrayOf(token))
-            currentText += char
+            currentText += decoder.push(token)
             count++
 
             val elapsedSec = (System.currentTimeMillis() - startTime) / 1000.0f
@@ -53,6 +54,7 @@ class StreamingSession(
             )
         }
 
+        currentText += decoder.flush()
         val totalSec = (System.currentTimeMillis() - startTime) / 1000.0f
         val finalTps = if (totalSec > 0.001f) count.toFloat() / totalSec else 0.0f
         val finalState = GenerationState(
@@ -66,3 +68,4 @@ class StreamingSession(
         return finalState
     }
 }
+

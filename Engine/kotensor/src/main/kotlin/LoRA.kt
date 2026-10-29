@@ -5,7 +5,7 @@ import kotlin.math.sqrt
 import kotlin.random.Random
 
 class LoRALinear(
-    val baseLinear: Linear,
+    val baseLinear: Projection,
     val rank: Int = 4,
     val alpha: Float = 1.0f
 ) : Module() {
@@ -34,6 +34,15 @@ class LoRALinear(
         return baseOutput + scaledLora
     }
 
+    private val lowRank = Tensor(FloatArray(rank), intArrayOf(1, rank))
+
+    override fun forwardInto(input: Tensor, out: Tensor): Tensor {
+        require(input.shape.size == 2 && input.shape[0] == 1) { "forwardInto takes a single token row, got ${input.shape.contentToString()}" }
+        baseLinear.forwardInto(input, out)
+        input.matmulInto(loraA, lowRank)
+        return lowRank.matmulInto(loraB, out, accumulate = true, scale = scaling)
+    }
+
     override fun parameters(): List<Tensor> {
         return listOf(loraA, loraB)
     }
@@ -54,13 +63,13 @@ class LoRAAdapter(
     init {
         for (l in model.blocks.indices) {
             val block = model.blocks[l]
-            val qLinear = block.attention.wQ as? Linear
+            val qLinear = block.attention.wQ as? Projection
             if (qLinear != null) {
                 val qLora = LoRALinear(qLinear, rank, alpha)
                 block.attention.wQ = qLora
                 layers["block.$l.attention.wQ"] = qLora
             }
-            val vLinear = block.attention.wV as? Linear
+            val vLinear = block.attention.wV as? Projection
             if (vLinear != null) {
                 val vLora = LoRALinear(vLinear, rank, alpha)
                 block.attention.wV = vLora
@@ -77,17 +86,14 @@ class LoRAAdapter(
         return params
     }
 
-    /**
-     * Folds each adapter's delta into its base Linear weights and puts the plain Linear
-     * layers back into the model, so the adaptation is applied exactly once. After merging,
-     * the model is a regular Transformer again and this adapter has no layers left.
-     */
     fun merge() {
         val merged = layers.values.toSet()
         for (layer in merged) {
+            val base = layer.baseLinear as? Linear
+                ?: throw IllegalStateException("Cannot merge an adapter into quantized weights; export it with saveDelta instead")
             val delta = layer.deltaWeights()
-            for (i in layer.baseLinear.weight.data.indices) {
-                layer.baseLinear.weight.data[i] += delta.data[i]
+            for (i in base.weight.data.indices) {
+                base.weight.data[i] += delta.data[i]
             }
         }
         for (block in model.blocks) {
@@ -130,3 +136,4 @@ class LoRAAdapter(
         }
     }
 }
+

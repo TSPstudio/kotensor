@@ -8,7 +8,7 @@ class Tensor (
     val parents: List<Tensor> = emptyList(),
     val backwardOp: () -> Unit = {}
 ){
-    val grad = FloatArray(data.size)
+    val grad: FloatArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(data.size) }
 
     init {
         var expectedSize = 1
@@ -130,30 +130,101 @@ class Tensor (
         require(k == otherk) { "$k != $otherk" }
         val outShape = intArrayOf(m, n)
         val outData = FloatArray(m * n)
-
-        for (i in 0 until m) {
-            for (j in 0 until n) {
-                var sum = 0.0f
-                for (l in 0 until k) {
-                    sum += this.data[i * k + l] * other.data[l * n + j]
-                }
-                outData[i * n + j] = sum
-            }
-        }
+        MatMul.multiply(this.data, other.data, outData, m, k, n, accumulate = false)
 
         lateinit var out: Tensor
         out = Tensor(outData, outShape, listOf(this, other)) {
-            for (i in 0 until m) {
-                for (j in 0 until n) {
-                    val outGrad = out.grad[i * n + j]
-                    for (l in 0 until k) {
-                        this.grad[i * k + l] += outGrad * other.data[l * n + j]
-                        other.grad[l * n + j] += outGrad * this.data[i * k + l]
-                    }
-                }
+
+            val otherT = FloatArray(k * n)
+            MatMul.transpose(other.data, k, n, otherT)
+            MatMul.multiply(out.grad, otherT, this.grad, m, n, k)
+
+            val thisT = FloatArray(m * k)
+            MatMul.transpose(this.data, m, k, thisT)
+            MatMul.multiply(thisT, out.grad, other.grad, k, m, n)
+        }
+        return out
+    }
+
+    fun matmulDequant(weight: QuantizedTensor): Tensor {
+        require(this.shape.size == 2) { "not a matrix" }
+        val m = this.shape[0]
+        val k = this.shape[1]
+        require(k == weight.rows) { "$k != ${weight.rows}" }
+        val n = weight.columns
+        val outData = FloatArray(m * n)
+        MatMul.multiplyQuantized(this.data, weight, outData, m, accumulate = false)
+
+        lateinit var out: Tensor
+        out = Tensor(outData, intArrayOf(m, n), listOf(this)) {
+            MatMul.multiplyByQuantizedTransposed(out.grad, weight, this.grad, m)
+        }
+        return out
+    }
+
+    fun matmulDequantInto(weight: QuantizedTensor, out: Tensor, accumulate: Boolean = false, scale: Float = 1.0f): Tensor {
+        require(this.shape.size == 2 && out.shape.size == 2) { "not matrices" }
+        val m = this.shape[0]
+        val k = this.shape[1]
+        require(k == weight.rows) { "$k != ${weight.rows}" }
+        require(out.shape[0] == m && out.shape[1] == weight.columns) { "out shape ${out.shape.contentToString()} != [$m, ${weight.columns}]" }
+        MatMul.multiplyQuantized(this.data, weight, out.data, m, accumulate, scale)
+        return out
+    }
+
+    fun matmulInto(other: Tensor, out: Tensor, accumulate: Boolean = false, scale: Float = 1.0f): Tensor {
+        require(this.shape.size == 2 && other.shape.size == 2 && out.shape.size == 2) { "not matrices" }
+        val m = this.shape[0]
+        val k = this.shape[1]
+        val n = other.shape[1]
+        require(k == other.shape[0]) { "$k != ${other.shape[0]}" }
+        require(out.shape[0] == m && out.shape[1] == n) { "out shape ${out.shape.contentToString()} != [$m, $n]" }
+        MatMul.multiply(this.data, other.data, out.data, m, k, n, accumulate, scale)
+        return out
+    }
+
+    fun addInto(other: Tensor, out: Tensor): Tensor {
+        require(out.data.size == data.size) { "out has ${out.data.size} elements, this has ${data.size}" }
+        if (other.data.size == data.size) {
+            for (i in data.indices) {
+                out.data[i] = data[i] + other.data[i]
+            }
+            return out
+        }
+        require(data.size % other.data.size == 0) { "Shape mismatch: ${shape.contentToString()} and ${other.shape.contentToString()}" }
+        val cols = other.data.size
+        val rows = data.size / cols
+        for (r in 0 until rows) {
+            val rowOffset = r * cols
+            for (c in 0 until cols) {
+                out.data[rowOffset + c] = data[rowOffset + c] + other.data[c]
             }
         }
         return out
+    }
+
+    fun addInPlace(other: Tensor): Tensor = addInto(other, this)
+
+    fun mulInPlace(other: Tensor): Tensor {
+        require(other.data.size == data.size) { "Shape mismatch: ${shape.contentToString()} and ${other.shape.contentToString()}" }
+        for (i in data.indices) {
+            data[i] *= other.data[i]
+        }
+        return this
+    }
+
+    fun siluInPlace(): Tensor {
+        for (i in data.indices) {
+            val x = data[i]
+            data[i] = x / (1.0f + kotlin.math.exp(-x))
+        }
+        return this
+    }
+
+    fun copyFrom(source: Tensor): Tensor {
+        require(source.data.size == data.size) { "Size mismatch: ${source.data.size} != ${data.size}" }
+        System.arraycopy(source.data, 0, data, 0, data.size)
+        return this
     }
 
     fun reshape(newShape: IntArray): Tensor {
@@ -267,3 +338,4 @@ class Tensor (
         return out
     }
 }
+

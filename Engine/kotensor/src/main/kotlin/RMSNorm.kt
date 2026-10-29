@@ -61,7 +61,29 @@ class RMSNorm(
         return out
     }
 
+    override fun forwardInto(input: Tensor, out: Tensor): Tensor {
+        val totalElements = input.data.size
+        require(totalElements % dimension == 0) { "Input elements $totalElements not divisible by dimension $dimension" }
+        require(out.data.size == totalElements) { "out has ${out.data.size} elements, input has $totalElements" }
+        val rows = totalElements / dimension
+
+        for (r in 0 until rows) {
+            val rowOffset = r * dimension
+            var sumSq = 0.0f
+            for (d in 0 until dimension) {
+                val x = input.data[rowOffset + d]
+                sumSq += x * x
+            }
+            val rRms = 1.0f / sqrt(sumSq / dimension + eps)
+            for (d in 0 until dimension) {
+                out.data[rowOffset + d] = input.data[rowOffset + d] * rRms * weight.data[d]
+            }
+        }
+        return out
+    }
+
     override fun parameters(): List<Tensor> {
         return listOf(weight)
     }
 }
+

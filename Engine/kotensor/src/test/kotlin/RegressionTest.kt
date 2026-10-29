@@ -54,6 +54,36 @@ class RegressionTest {
     }
 
     @Test
+    fun testRoPERotatesEveryHeadWithTheTokenPosition() {
+        val headDim = 4
+        val numHeads = 3
+        val tokens = 5
+        val rope = RoPE(headDim)
+        val rowWidth = numHeads * headDim
+        val input = Tensor(FloatArray(tokens * rowWidth) { i -> ((i * 7) % 11).toFloat() * 0.1f - 0.5f }, intArrayOf(tokens, rowWidth))
+
+        val allHeads = rope.apply(input, startPosition = 2)
+
+        for (h in 0 until numHeads) {
+            val headData = FloatArray(tokens * headDim) { i -> input.data[(i / headDim) * rowWidth + h * headDim + i % headDim] }
+            val oneHead = rope.apply(Tensor(headData, intArrayOf(tokens, headDim)), startPosition = 2)
+            for (t in 0 until tokens) {
+                for (d in 0 until headDim) {
+                    assertEquals(oneHead.data[t * headDim + d], allHeads.data[t * rowWidth + h * headDim + d], 1e-6f, "token $t head $h dim $d")
+                }
+            }
+        }
+
+        val sameVectorEveryToken = Tensor(FloatArray(tokens * rowWidth) { i -> ((i % rowWidth) + 1).toFloat() }, intArrayOf(tokens, rowWidth))
+        val rotated = rope.apply(sameVectorEveryToken)
+        var token0DiffersFromToken2 = false
+        for (d in 0 until headDim) {
+            if (kotlin.math.abs(rotated.data[d] - rotated.data[2 * rowWidth + d]) > 1e-4f) token0DiffersFromToken2 = true
+        }
+        assertTrue(token0DiffersFromToken2, "different positions must rotate differently")
+    }
+
+    @Test
     fun testNamedParametersIncludeLoRAWrappedProjections() {
         val model = Transformer(vocabularySize = 8, dimension = 16, numLayers = 1, numHeads = 2)
         val namesBefore = model.namedParameters().keys
@@ -65,3 +95,4 @@ class RegressionTest {
         assertTrue(namesAfter.contains("block.0.attention.wV.weight"))
     }
 }
+
