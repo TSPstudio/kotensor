@@ -20,6 +20,10 @@
 
 ---
 
+## What *is* Kotensor?
+
+Kotensor is a lightweight, pure-Kotlin machine learning and generative Transformer engine designed for JVM and Android environments. It provides automatic differentiation, neural network modules, decoders, on-device LoRA fine-tuning, and SafeTensors serialization natively in Kotlin—without external C++, Python, or JNI dependencies.
+
 ## Why Kotensor
 
 Kotensor implements the full training loop — tensors, reverse-mode autograd, optimizers, a modern decoder-only Transformer, LoRA adapters and `.safetensors` serialization — in plain Kotlin. Its only runtime dependency is the Kotlin standard library (plus `java.io` / `java.nio` for file I/O), so there is no JNI, no native runtime and no Python toolchain to ship.
@@ -31,6 +35,8 @@ Kotensor implements the full training loop — tensors, reverse-mode autograd, o
 
 ## Contents
 
+- [What *is* Kotensor?](#what-is-kotensor)
+- [Why Kotensor](#why-kotensor)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Usage guide](#usage-guide)
@@ -466,8 +472,6 @@ The five planned layers are implemented.
 - [x] LoRA adapters and fine-tuning pipeline — `LoRA.kt`, `FineTuningPipeline.kt`
 </details>
 
-**Next:** [PLACEHOLDER: upcoming roadmap items]
-
 ## Contributing
 
 Issues and pull requests are welcome at [github.com/TSPstudio/kotensor](https://github.com/TSPstudio/kotensor).
@@ -475,8 +479,6 @@ Issues and pull requests are welcome at [github.com/TSPstudio/kotensor](https://
 1. Run `./gradlew test` and make sure every suite passes.
 2. Add tests for new ops, including their backward pass.
 3. Keep the runtime dependency-free: Kotlin and the JDK only.
-
-[PLACEHOLDER: link to CONTRIBUTING.md and code of conduct, if added]
 
 ## License
 

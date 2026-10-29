@@ -15,10 +15,14 @@
   <img alt="JVM 21" src="https://img.shields.io/badge/JVM-21-16151C?style=flat-square">
   <img alt="Tests: 12 passing" src="https://img.shields.io/badge/tests-15%20passing-16151C?style=flat-square">
   <img alt="Runtime dependencies: Kotlin stdlib only" src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-364FC7?style=flat-square">
-  <img alt="License" src="https://img.shields.io/badge/license-[PLACEHOLDER%3A%20LICENSE]-16151C?style=flat-square">
+  <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-16151C?style=flat-square">
 </p>
 
 ---
+
+## What *is* Kotensor?
+
+Kotensor is a lightweight, pure-Kotlin machine learning and generative Transformer engine designed for JVM and Android environments. It provides automatic differentiation, neural network modules, decoders, on-device LoRA fine-tuning, and SafeTensors serialization natively in Kotlin—without external C++, Python, or JNI dependencies.
 
 ## Why Kotensor
 
@@ -31,6 +35,8 @@ Kotensor implements the full training loop — tensors, reverse-mode autograd, o
 
 ## Contents
 
+- [What *is* Kotensor?](#what-is-kotensor)
+- [Why Kotensor](#why-kotensor)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Usage guide](#usage-guide)
@@ -466,8 +472,6 @@ The five planned layers are implemented.
 - [x] LoRA adapters and fine-tuning pipeline — `LoRA.kt`, `FineTuningPipeline.kt`
 </details>
 
-**Next:** [PLACEHOLDER: upcoming roadmap items]
-
 ## Contributing
 
 Issues and pull requests are welcome at [github.com/TSPstudio/kotensor](https://github.com/TSPstudio/kotensor).
@@ -476,11 +480,9 @@ Issues and pull requests are welcome at [github.com/TSPstudio/kotensor](https://
 2. Add tests for new ops, including their backward pass.
 3. Keep the runtime dependency-free: Kotlin and the JDK only.
 
-[PLACEHOLDER: link to CONTRIBUTING.md and code of conduct, if added]
-
 ## License
 
-[PLACEHOLDER: LICENSE NAME] — see [`LICENSE`](LICENSE). [PLACEHOLDER: add a LICENSE file to the repository root]
+Apache License 2.0 — see [`LICENSE`](LICENSE).
 
 <p align="center">
   <sub>Built in Kotlin, from the tensor up.</sub>
