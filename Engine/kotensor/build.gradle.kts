@@ -32,6 +32,12 @@ tasks.test {
     useJUnitPlatform()
 }
 
+tasks.withType<Jar>().configureEach {
+    metaInf {
+        from(file("../../LICENSE"), file("../../NOTICE"))
+    }
+}
+
 dokka {
     moduleName.set("Kotensor")
     dokkaSourceSets.main {

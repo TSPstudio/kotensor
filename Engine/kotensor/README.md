@@ -818,6 +818,8 @@ The five planned layers are implemented, and so are all five milestones of [`Mil
 
 Apache License 2.0 — see [`LICENSE`](../../LICENSE).
 
+Anyone who redistributes Kotensor or a work built on it — in source form, as a modified copy, or bundled inside an application or library — must keep the license and copyright notice and include the attribution in [`NOTICE`](../../NOTICE). The published JAR carries both files in `META-INF`.
+
 <p align="center">
   <sub>Built in Kotlin, from the tensor up.</sub>
 </p>
