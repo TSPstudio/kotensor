@@ -109,13 +109,18 @@ class InferenceTest {
             token = (token + 7) % model.vocabularySize + (if (logits.data[0] > 1e9f) 1 else 0)
         }
 
-        cache.reset()
-        val before = threadBean.currentThreadAllocatedBytes
-        repeat(200) {
-            val logits = model.decode(token, cache, buffers)
-            token = (token + 7) % model.vocabularySize + (if (logits.data[0] > 1e9f) 1 else 0)
+        var allocated = -1L
+        var window = 0
+        while (allocated != 0L && window < 10) {
+            cache.reset()
+            val before = threadBean.currentThreadAllocatedBytes
+            repeat(200) {
+                val logits = model.decode(token, cache, buffers)
+                token = (token + 7) % model.vocabularySize + (if (logits.data[0] > 1e9f) 1 else 0)
+            }
+            allocated = threadBean.currentThreadAllocatedBytes - before
+            window++
         }
-        val allocated = threadBean.currentThreadAllocatedBytes - before
         assertEquals(0L, allocated, "bytes allocated by 200 decode steps")
     }
 

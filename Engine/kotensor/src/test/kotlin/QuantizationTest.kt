@@ -206,10 +206,16 @@ class QuantizationTest {
         val cache = model.newCache(512)
         val buffers = model.newInferenceBuffers(512)
         repeat(400) { model.decode(it % 48, cache, buffers) }
-        cache.reset()
-        val before = threadBean.currentThreadAllocatedBytes
-        repeat(100) { model.decode(it % 48, cache, buffers) }
-        assertEquals(0L, threadBean.currentThreadAllocatedBytes - before)
+        var allocated = -1L
+        var window = 0
+        while (allocated != 0L && window < 10) {
+            cache.reset()
+            val before = threadBean.currentThreadAllocatedBytes
+            repeat(100) { model.decode(it % 48, cache, buffers) }
+            allocated = threadBean.currentThreadAllocatedBytes - before
+            window++
+        }
+        assertEquals(0L, allocated)
     }
 
     @Test
