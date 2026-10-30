@@ -44,10 +44,14 @@ class Embedding(
 
         lateinit var out: Tensor
         out = Tensor(outData, outShape, listOf(weight)) {
-            for (t in indices.indices) {
-                val token = indices[t]
-                for (d in 0 until embeddingDim) {
-                    weight.grad[token * embeddingDim + d] += out.grad[t * embeddingDim + d]
+            if (weight.requiresGrad) {
+                val weightGrad = weight.grad
+                val outGrad = out.grad
+                for (t in indices.indices) {
+                    val token = indices[t]
+                    for (d in 0 until embeddingDim) {
+                        weightGrad[token * embeddingDim + d] += outGrad[t * embeddingDim + d]
+                    }
                 }
             }
         }
@@ -86,7 +90,7 @@ class QuantizedEmbedding(
             require(token in 0 until vocabularySize) { "$token out of vocab bounds $vocabularySize" }
             weight.dequantizeRow(token, outData, t * embeddingDim)
         }
-        return Tensor(outData, intArrayOf(indices.size, embeddingDim))
+        return Tensor(outData, intArrayOf(indices.size, embeddingDim)).also { it.requiresGrad = false }
     }
 
     override fun lookupInto(token: Int, out: Tensor): Tensor {

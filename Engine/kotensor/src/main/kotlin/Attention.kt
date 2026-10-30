@@ -101,7 +101,14 @@ class Attention(
 
         lateinit var context: Tensor
         context = Tensor(contextData, intArrayOf(tokens, dimension), listOf(qRoPE, kRoPE, vProj)) {
-            val dAttnWeights = FloatArray(numHeads * tokens * tokens)
+            val needQ = qRoPE.requiresGrad
+            val needK = kRoPE.requiresGrad
+            val needScores = needQ || needK
+            val contextGrad = context.grad
+            val vGrad = if (vProj.requiresGrad) vProj.grad else null
+            val qGrad = if (needQ) qRoPE.grad else null
+            val kGrad = if (needK) kRoPE.grad else null
+            val dAttnWeights = FloatArray(if (needScores) numHeads * tokens * tokens else 0)
 
             for (h in 0 until numHeads) {
                 val headOffset = h * headDim
@@ -112,13 +119,21 @@ class Attention(
                     val rowOffset = matrixOffset + i * tokens
                     val seqStart = (i / sequenceLength) * sequenceLength
 
+                    if (vGrad != null) {
+                        for (j in seqStart..i) {
+                            val w = attnWeights[rowOffset + j]
+                            for (d in 0 until headDim) {
+                                vGrad[j * kvDimension + kvOffset + d] += contextGrad[i * dimension + headOffset + d] * w
+                            }
+                        }
+                    }
+
+                    if (!needScores) continue
+
                     for (j in seqStart..i) {
                         var dWeight = 0.0f
                         for (d in 0 until headDim) {
-                            val dOut = context.grad[i * dimension + headOffset + d]
-                            val vVal = vProj.data[j * kvDimension + kvOffset + d]
-                            dWeight += dOut * vVal
-                            vProj.grad[j * kvDimension + kvOffset + d] += dOut * attnWeights[rowOffset + j]
+                            dWeight += contextGrad[i * dimension + headOffset + d] * vProj.data[j * kvDimension + kvOffset + d]
                         }
                         dAttnWeights[rowOffset + j] = dWeight
                     }
@@ -131,11 +146,15 @@ class Attention(
                     for (j in seqStart..i) {
                         val dScore = attnWeights[rowOffset + j] * (dAttnWeights[rowOffset + j] - sumDWeightWeight)
                         val scaledDScore = dScore * scale
-                        for (d in 0 until headDim) {
-                            val qVal = qRoPE.data[i * dimension + headOffset + d]
-                            val kVal = kRoPE.data[j * kvDimension + kvOffset + d]
-                            qRoPE.grad[i * dimension + headOffset + d] += scaledDScore * kVal
-                            kRoPE.grad[j * kvDimension + kvOffset + d] += scaledDScore * qVal
+                        if (qGrad != null) {
+                            for (d in 0 until headDim) {
+                                qGrad[i * dimension + headOffset + d] += scaledDScore * kRoPE.data[j * kvDimension + kvOffset + d]
+                            }
+                        }
+                        if (kGrad != null) {
+                            for (d in 0 until headDim) {
+                                kGrad[j * kvDimension + kvOffset + d] += scaledDScore * qRoPE.data[i * dimension + headOffset + d]
+                            }
                         }
                     }
                 }

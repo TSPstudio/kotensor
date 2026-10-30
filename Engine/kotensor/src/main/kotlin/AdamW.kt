@@ -22,6 +22,7 @@ class AdamW(
 
         for(p in parameters.indices){
             val tensor = parameters[p]
+            if (!tensor.requiresGrad) continue
             val m = momentum[p]
             val v = variance[p]
 
@@ -42,7 +43,7 @@ class AdamW(
 
     fun zeroGrad(){
         for(tensor in parameters){
-            tensor.grad.fill(0.0f)
+            if (tensor.hasGrad) tensor.grad.fill(0.0f)
         }
     }
 }

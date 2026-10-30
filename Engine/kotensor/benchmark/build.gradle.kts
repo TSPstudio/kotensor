@@ -23,4 +23,7 @@ jmh {
     resultFormat.set("JSON")
     resultsFile.set(layout.buildDirectory.file("results/jmh/results.json"))
     jvmArgs.add("-Xmx3g")
+    if (providers.gradleProperty("kotensor.vectorApi").orNull == "true") {
+        jvmArgs.add("--add-modules=jdk.incubator.vector")
+    }
 }

@@ -34,27 +34,34 @@ class RMSNorm(
 
         lateinit var out: Tensor
         out = Tensor(outData, input.shape.copyOf(), listOf(input, weight)) {
+            val outGrad = out.grad
+            val weightGrad = if (weight.requiresGrad) weight.grad else null
+            val inputGrad = if (input.requiresGrad) input.grad else null
             for (r in 0 until rows) {
                 val rowOffset = r * dimension
                 val rRms = invRms[r]
 
+                if (weightGrad != null) {
+                    for (d in 0 until dimension) {
+                        weightGrad[d] += outGrad[rowOffset + d] * (input.data[rowOffset + d] * rRms)
+                    }
+                }
+
+                if (inputGrad == null) continue
+
                 var sumDyGammaX = 0.0f
                 for (d in 0 until dimension) {
-                    val dy = out.grad[rowOffset + d]
-                    val gamma = weight.data[d]
-                    val x = input.data[rowOffset + d]
-                    sumDyGammaX += dy * gamma * x
-                    weight.grad[d] += dy * (x * rRms)
+                    sumDyGammaX += outGrad[rowOffset + d] * weight.data[d] * input.data[rowOffset + d]
                 }
 
                 val rRmsCubeOverDim = (rRms * rRms * rRms) / dimension
                 for (d in 0 until dimension) {
-                    val dy = out.grad[rowOffset + d]
+                    val dy = outGrad[rowOffset + d]
                     val gamma = weight.data[d]
                     val x = input.data[rowOffset + d]
                     val term1 = dy * gamma * rRms
                     val term2 = x * rRmsCubeOverDim * sumDyGammaX
-                    input.grad[rowOffset + d] += term1 - term2
+                    inputGrad[rowOffset + d] += term1 - term2
                 }
             }
         }

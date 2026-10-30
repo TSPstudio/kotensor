@@ -7,10 +7,11 @@ class FineTuningPipeline(
     val adapter: LoRAAdapter,
     val optimizer: AdamW
 ) {
+    private val trainedTensors = optimizer.parameters.toHashSet()
 
     fun trainStep(input: Tensor, target: Tensor): Float {
-        val logits = model.forward(input)
-        val loss = crossEntropyLoss(logits, target)
+        if (countActiveTargets(target) == 0) return 0.0f
+        val loss = model.loss(input, target)
         loss.backward()
         optimizer.step()
         optimizer.zeroGrad()
@@ -20,11 +21,11 @@ class FineTuningPipeline(
 
     private fun clearFrozenGradients() {
         for (p in model.parameters()) {
-            p.grad.fill(0.0f)
+            if (p.hasGrad && p !in trainedTensors) p.grad.fill(0.0f)
         }
         for (layer in adapter.layers.values) {
             for (p in layer.baseLinear.parameters()) {
-                p.grad.fill(0.0f)
+                if (p.hasGrad && p !in trainedTensors) p.grad.fill(0.0f)
             }
         }
     }
@@ -32,21 +33,33 @@ class FineTuningPipeline(
     fun train(
         dataLoader: DataLoader,
         epochs: Int,
-        onEpochEnd: (Int, Float) -> Unit = { _, _ -> }
+        onBatchEnd: (epoch: Int, batch: Int, totalBatches: Int, loss: Float) -> Unit = { _, _, _, _ -> },
+        onEpochEnd: (epoch: Int, avgLoss: Float) -> Unit = { _, _ -> }
     ) {
+        val totalBatches = dataLoader.totalBatches
         for (epoch in 1..epochs) {
             var totalLoss = 0.0f
-            var batchCount = 0
+            var trainedBatches = 0
+            var batch = 0
             dataLoader.reset()
             while (dataLoader.hasNext()) {
                 val (x, y) = dataLoader.nextBatch()
+                batch++
                 val loss = trainStep(x, y)
-                totalLoss += loss
-                batchCount++
+                if (countActiveTargets(y) > 0) {
+                    totalLoss += loss
+                    trainedBatches++
+                }
+                onBatchEnd(epoch, batch, totalBatches, loss)
             }
-            val avgLoss = if (batchCount > 0) totalLoss / batchCount else 0.0f
+            val avgLoss = if (trainedBatches > 0) totalLoss / trainedBatches else 0.0f
             onEpochEnd(epoch, avgLoss)
         }
+    }
+
+    @Deprecated("Use train(dataLoader, epochs, onBatchEnd, onEpochEnd)", level = DeprecationLevel.HIDDEN)
+    fun train(dataLoader: DataLoader, epochs: Int, onEpochEnd: (Int, Float) -> Unit = { _, _ -> }) {
+        train(dataLoader, epochs, onEpochEnd = onEpochEnd)
     }
 
     fun exportAdapter(file: File) {
@@ -61,4 +74,3 @@ class FineTuningPipeline(
         adapter.merge()
     }
 }
-

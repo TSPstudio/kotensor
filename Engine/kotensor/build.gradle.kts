@@ -12,7 +12,7 @@ plugins {
 }
 
 group = "io.github.tspstudio"
-version = "1.0.0"
+version = "1.1.0"
 
 dependencies {
     testImplementation(kotlin("test"))
@@ -22,7 +22,7 @@ kotlin {
     jvmToolchain(21)
     compilerOptions {
         jvmTarget.set(JvmTarget.JVM_17)
-        freeCompilerArgs.add("-Xjdk-release=17")
+        freeCompilerArgs.addAll("-Xjdk-release=17", "-Xadd-modules=jdk.incubator.vector")
     }
 }
 
@@ -30,8 +30,18 @@ tasks.withType<JavaCompile>().configureEach {
     options.release.set(17)
 }
 
+val vectorApiTest by tasks.registering(Test::class) {
+    description = "Runs the test suite with the Vector API backend enabled."
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform()
+    jvmArgs("--add-modules", "jdk.incubator.vector")
+}
+
 tasks.test {
     useJUnitPlatform()
+    finalizedBy(vectorApiTest)
 }
 
 tasks.withType<Jar>().configureEach {

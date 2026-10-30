@@ -1,0 +1,1 @@
+-dontwarn jdk.incubator.vector.**

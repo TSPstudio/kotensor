@@ -6,6 +6,7 @@ class SGD(
 ) {
     fun step(){
         for(tensor in parameters){
+            if (!tensor.requiresGrad) continue
             for(i in tensor.data.indices){
                 tensor.data[i] -= learningRate * tensor.grad[i]
             }
@@ -14,7 +15,7 @@ class SGD(
 
     fun zeroGrad(){
         for(tensor in parameters){
-            tensor.grad.fill(0.0f)
+            if (tensor.hasGrad) tensor.grad.fill(0.0f)
         }
     }
 }

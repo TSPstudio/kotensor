@@ -56,12 +56,17 @@ class LoRALinear(
 class LoRAAdapter(
     val model: Transformer,
     val rank: Int = 4,
-    val alpha: Float = 1.0f
+    val alpha: Float = 1.0f,
+    blockIndices: Iterable<Int>
 ) {
+    constructor(model: Transformer, rank: Int = 4, alpha: Float = 1.0f) : this(model, rank, alpha, model.blocks.indices)
+
     val layers = mutableMapOf<String, LoRALinear>()
+    private val frozen = mutableListOf<Tensor>()
 
     init {
-        for (l in model.blocks.indices) {
+        for (l in blockIndices) {
+            require(l in model.blocks.indices) { "Block $l out of range 0 until ${model.blocks.size}" }
             val block = model.blocks[l]
             val qLinear = block.attention.wQ as? Projection
             if (qLinear != null) {
@@ -74,6 +79,12 @@ class LoRAAdapter(
                 val vLora = LoRALinear(vLinear, rank, alpha)
                 block.attention.wV = vLora
                 layers["block.$l.attention.wV"] = vLora
+            }
+        }
+        for (tensor in model.namedParameters().values) {
+            if (tensor.requiresGrad) {
+                tensor.requiresGrad = false
+                frozen.add(tensor)
             }
         }
     }
@@ -107,6 +118,8 @@ class LoRAAdapter(
             }
         }
         layers.clear()
+        for (tensor in frozen) tensor.requiresGrad = true
+        frozen.clear()
     }
 
     fun saveDelta(file: File) {

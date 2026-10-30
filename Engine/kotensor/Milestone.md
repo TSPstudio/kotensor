@@ -22,7 +22,7 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
                              ▼                                 ▼
                       v0.4.0 (Done)                   v0.5.0 (Done)
                              │                                 │
-                             └────────────────► v1.0.0 (Current)
+                             └────────────────► v1.0.0 (Done) ──────► v1.1.0 (Current)
 ```
 
 ---
@@ -165,6 +165,44 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
 | **API Documentation** | Automated Dokka build pipeline generating searchable HTML documentation. |
 | **Maven Central** | Sonatype Central Portal release under `io.github.tspstudio:kotensor` with automated GPG signing and SHA-256 validation. |
 | **Benchmark Suite** | JMH (Java Microbenchmark Harness) benchmarking FLOPs, memory allocations, and tokens/second across sequence lengths. |
+
+---
+
+### Milestone 6 (v1.1.0): Training Engine Efficiency ✅
+
+**Goal:** Make on-device fine-tuning of real vocabularies practical on the CPU — LoRA steps on a Qwen2-0.5B-class model in seconds rather than tens of seconds, in a heap a laptop or phone can spare.
+
+**Status: complete.** Delivered in `Loss.kt`, `Transformer.kt`, `Tensor.kt`, `Module.kt`, `MatMul.kt`, the new `SimdKernels.kt`, `LoRA.kt`, `DataLoader.kt`, `FineTuningPipeline.kt`, `AdamW.kt`, `SGD.kt` and the backward closures of `Attention.kt`, `RMSNorm.kt`, `RoPE.kt` and `Embedding.kt`; verified by `TrainingTest` (12 tests), and the whole suite — now 78 tests — passes on the scalar kernels and again on the Vector API (`vectorApiTest`). [`CHANGELOG.md`](CHANGELOG.md) describes every change.
+- **Loss masking:** `crossEntropyLoss` skips rows whose target is `IGNORE_INDEX` (−100); `DataLoader` takes optional `labels`, and `DataLoader.promptMasked` builds them from (prompt, response) pairs so only response tokens are learned.
+- **Fused output projection + cross-entropy:** `fusedCrossEntropyLoss(hidden, head, targets)` projects only the active rows, at most 16 MB of logits at a time, and produces the loss and the hidden-state gradient in one pass; `Transformer.loss` / `hiddenStates` use it, and `FineTuningPipeline` trains through it. Loss and gradients equal the unfused path.
+- **Early backward termination:** `Tensor.requiresGrad` (inherited by operation results) and `Module.requiresGrad`; every backward operation skips frozen operands, and `backward()` never enters a frozen subgraph. `LoRAAdapter` freezes the base until `merge()` and can target selected blocks (`blockIndices`), so nothing below the lowest adapter is back-propagated; optimizers skip frozen tensors.
+- **Backward without transposed copies:** `MatMul.multiplyTransposedA` (`Aᵀ · B`, by strides) and `multiplyTransposedB` (`A · Bᵀ`, by chunked transposition or SIMD dot products) replace the full transposed copies the matmul backward made — 544 MB per step for Qwen's output head.
+- **Vector API:** `SimdKernels` uses `FloatVector.SPECIES_PREFERRED` and fused multiply-add when the JVM runs with `--add-modules jdk.incubator.vector`; `MatMul.useVectorApi` toggles it, and Android and JVMs without the module keep the scalar kernels. Decode steps always use the scalar kernels, keeping them allocation-free.
+- **Telemetry:** `FineTuningPipeline.train(…, onBatchEnd = { epoch, batch, totalBatches, loss -> … })` reports every batch.
+- **Measured** on a 2-core AVX-512 container, Qwen2-0.5B shape, rank-8 LoRA, a 64-token batch with 18 response tokens: the full 24-layer model trains at 3.0 s per step with the Vector API and 4.6 s on the scalar kernels in 2.8 GB, where 1.0.0 ran out of a 6 GB heap; at 4 layers a step went from 3.87 s to 1.46 s (0.81 s with the Vector API) with half the memory.
+
+#### 1. Bottlenecks identified
+| Area | Problem in v1.0.0 |
+| :-- | :-- |
+| Output projection (`lmHead`) | 896 × 151,936 weights: a 64-token batch produced a 9.7 M-float logits tensor, and the backward pass computed `[64 × 151,936] · [151,936 × 896]` for the input gradient plus the same again for the frozen weight's gradient |
+| Unmasked loss | `crossEntropyLoss` computed loss and gradients for every token, prompt tokens included — up to 70% of the output-layer work in instruction tuning |
+| Frozen layers | `loss.backward()` computed weight gradients for every frozen projection in all 24 layers, and `FineTuningPipeline` discarded them after each step |
+| SIMD | The matmul relied on the JIT's auto-vectorization, which never vectorizes the dot products of the backward pass |
+| Telemetry | `train` reported only at the end of each epoch, so long CPU runs looked frozen |
+
+#### 2. Technical specification
+* **Loss masking (priority: high):** an `ignoreIndex = -100` convention in `DataLoader` and `crossEntropyLoss`; prompt targets marked `-100`; no exponentials or gradients for masked positions.
+* **Fused linear + cross-entropy (priority: high):** never allocate the `[B, S, vocabulary]` tensor; compute the softmax denominator and the cross-entropy gradient while streaming over the `lmHead` weights, and back-propagate directly into the hidden states.
+* **Early backward termination (priority: high):** a `requiresGrad` flag on `Tensor` and `Module`; stop the topological traversal where every remaining ancestor is frozen.
+* **JVM Vector API (priority: medium):** an optional vectorized backend in `MatMul.kt` using `FloatVector.SPECIES_PREFERRED` and `fma`, falling back to array loops on Android.
+* **Batch telemetry (priority: high):** `train(dataLoader, epochs, onBatchEnd = { epoch, batch, totalBatches, loss -> }, onEpochEnd = { epoch, avgLoss -> })`.
+
+| Metric | v1.0.0 | Planned | Measured in v1.1.0 (2-core container) |
+| :-- | :-- | :-- | :-- |
+| Active tokens per step | 64 | ~18 (response tokens only) | 18 with masking |
+| Output-layer floating-point operations per step | 52 billion (forward, input gradient, weight gradient) | ~4.8 billion | 9.8 billion (forward and input gradient for 18 tokens; no weight gradient) |
+| Output-layer time per step | — | — | 2.7 s → 0.70 s (0.33 s with the Vector API) |
+| Step time, full Qwen2-0.5B shape | ~15–18 s | ~2.5–3.5 s | 3.0 s with the Vector API, 4.6 s without; v1.0.0 ran out of a 6 GB heap |
 
 ---
 

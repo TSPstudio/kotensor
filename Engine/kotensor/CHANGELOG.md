@@ -1,6 +1,6 @@
-# Kotensor changelog — from v0.1.0 to v1.0.0
+# Kotensor changelog — from v0.1.0 to v1.1.0
 
-This document explains everything that changed in Kotensor between the original engine (v0.1.0, "milestone 0") and v1.0.0, following the five milestones of [`Milestone.md`](Milestone.md). For every modification it answers four questions:
+This document explains everything that changed in Kotensor between the original engine (v0.1.0, "milestone 0") and v1.1.0, following the six milestones of [`Milestone.md`](Milestone.md). For every modification it answers four questions:
 
 - **What changed** — the files and the new or changed behavior.
 - **Why it was needed** — the problem it solves, measured where possible.
@@ -17,6 +17,7 @@ This document explains everything that changed in Kotensor between the original 
 - [v0.4.0 — Architecture generalization and model importers](#v040--architecture-generalization-and-model-importers)
 - [v0.5.0 — Edge quantization (INT8 / INT4)](#v050--edge-quantization-int8--int4)
 - [v1.0.0 — Production hardening and ecosystem integration](#v100--production-hardening-and-ecosystem-integration)
+- [v1.1.0 — Training engine efficiency](#v110--training-engine-efficiency)
 - [Cross-cutting changes](#cross-cutting-changes)
 - [Known limitations and open items](#known-limitations-and-open-items)
 
@@ -45,6 +46,7 @@ What it could not do was serve as a real on-device engine:
 | 0.4.0 | Real models | Grouped-query attention, Llama 3 rope scaling, streaming F16/BF16 safetensors reader, Hugging Face importer | 54 |
 | 0.5.0 | Edge memory | INT8 / INT4 quantization, dequantizing kernels, QLoRA, compact model files, lazy gradients | 65 |
 | 1.0.0 | Production | Java 17 / Android readiness, Compose sample app, Dokka docs, Maven Central pipeline, JMH suite, CI | 66 |
+| 1.1.0 | Training efficiency | Loss masking, fused output-layer loss, frozen-weight backpropagation, matmul backward without copies, Vector API kernels, batch telemetry | 78 |
 
 ## How the work was verified
 
@@ -55,6 +57,8 @@ Every change was held to the same rule: a new code path must reproduce a trusted
 - **By measurement.** Speed claims come from benchmarks run on the same machine before and after each change, and "allocation-free" is measured with the JVM's per-thread allocation counter rather than assumed.
 
 The development environment could not download Gradle's distribution, the Gradle plugin portal or Maven Central, so the code was compiled with the standalone Kotlin 2.3.20 compiler and the test suites were run with a small reflection-based runner. The same test classes run under `./gradlew test`; you confirmed the Gradle run passed after milestone 2. The Gradle build scripts, the Android build and the GitHub workflows added in v1.0.0 could only be checked against official documentation, not executed — see [Known limitations](#known-limitations-and-open-items).
+
+v1.1.0 was held to the same rules: every fast path is compared with the computation it replaces (the fused loss with `Linear` plus `crossEntropyLoss`, frozen training with unfrozen training, the new kernels with a naive product, the Vector API kernels with the scalar ones). The development environment still could not reach Gradle's repositories, so the library was compiled with the standalone Kotlin 2.3.20 compiler, with the same flags as the build (`-Xjdk-release=17 -Xadd-modules=jdk.incubator.vector`), and the suite was run with the reflection runner twice — on the default scalar kernels and with `--add-modules jdk.incubator.vector` — and repeatedly, to rule out flaky allocation tests. The benchmark sources were compiled against stubs of the JMH annotations and every benchmark body run once, and a client compiled against the 1.0.0 classes was run against 1.1.0 to check binary compatibility. The timings come from hand-timed runs (one warm-up step, then the mean of three) on a 2-core container, so they show relative gains on that machine; the JMH suite is the tool for comparable numbers.
 
 ---
 
@@ -505,6 +509,132 @@ Every run includes JMH's `gc` profiler, which reports bytes allocated per operat
 
 ---
 
+## v1.1.0 — Training engine efficiency
+
+LoRA fine-tuning of a Qwen2-0.5B-sized model (896-dimensional, 24 layers, a 151,936-token vocabulary) showed where the training engine lost its time. Inference was already fast; backpropagation was not. The output projection produced a `[tokens × 151,936]` logits tensor and back-propagated through it in full, the loss was computed over prompt tokens that should not be learned, the backward pass computed weight gradients for every frozen projection, the backward matmul copied its weight transposed on every call, dot products ran without SIMD, and long training runs printed nothing between epochs. Version 1.1.0 addresses each of these; Milestone 6 in [`Milestone.md`](Milestone.md) records the plan and its estimates.
+
+### 1. Loss masking
+
+**Files:** `Loss.kt`, `DataLoader.kt`, `FineTuningPipeline.kt`.
+
+**What changed.** `crossEntropyLoss(logits, targets, ignoreIndex = IGNORE_INDEX)` skips every row whose target is `IGNORE_INDEX` (−100, the convention of PyTorch and Hugging Face). `DataLoader` takes an optional `labels` array the same length as `tokens`: the target of position *i* is `labels[i + 1]` instead of `tokens[i + 1]`. `DataLoader.promptMasked(examples, batchSize, sequenceLength)` builds tokens and labels from (prompt, response) pairs, with every prompt position labelled `IGNORE_INDEX`.
+
+**Why it was needed.** In instruction tuning, the model should learn to produce the response, not to predict the system prompt and the user's question. Computing the loss on prompt tokens trains the wrong objective and costs compute: in the plan's example batch of 64 tokens only about 18 belong to the response, so about 70% of the output-layer work was spent on tokens that should have been ignored.
+
+**How it works.** The rows whose target is not ignored are collected once. Only those rows get a softmax, a loss term and a gradient, and the probabilities are stored for those rows only. The loss is the mean over the active rows. If every target is masked, the loss is 0 and has no graph, so `backward()` does nothing. `promptMasked` labels the prompt, so the first response token is still learned (it is predicted from the last prompt token) and predictions across example boundaries are masked automatically.
+
+**What we looked for.** The masked loss equals the loss of the active rows computed on their own, masked rows receive exactly zero gradient, targets outside the vocabulary other than the ignore index are still rejected, and float targets of −100 (the `Tensor` overload) work the same way. `DataLoader` returns targets from `labels`, and `promptMasked` produces the expected arrays.
+
+### 2. Fused output projection and cross-entropy
+
+**Files:** `Loss.kt` (`fusedCrossEntropyLoss`), `Transformer.kt` (`hiddenStates`, `loss`).
+
+**What changed.** `fusedCrossEntropyLoss(hidden, head, targets, ignoreIndex)` computes the output projection and the cross-entropy together, for a `Linear` or `QuantizedLinear` head. `Transformer.hiddenStates(input)` returns the final normalized hidden states, and `Transformer.loss(input, targets)` combines the two; it falls back to `crossEntropyLoss(lmHead(hidden), …)` for any other kind of head. `FineTuningPipeline.trainStep` trains through `model.loss`.
+
+**Why it was needed.** For 64 tokens and Qwen's vocabulary, the unfused path allocated the 9.7-million-float logits tensor, a probability array of the same size, a gradient array for the logits, a gradient array for the matmul output and, in the matmul backward, a transposed copy of the 136-million-float head weight — about 0.7 GB of temporary memory per step — and it computed the head's weight gradient even when the head was frozen.
+
+**How it works.** The active rows (see 1) are processed a few at a time, so that a chunk of logits is at most 4 Mi floats (16 MB); with Qwen's vocabulary that is 27 rows, so a masked batch fits in one chunk. For each chunk the rows are gathered, projected with the ordinary matmul kernel and the bias added; each row's maximum and sum of exponentials give its loss term. The chunk is then turned in place into the gradient of the logits, `(softmax − one-hot) / active rows`, and multiplied by the transposed head weight to give the gradient of the hidden states (`multiplyTransposedB`, or `multiplyByQuantizedTransposed` for a quantized head). These hidden-state gradients, `active rows × dimension` floats, are kept, together with each row's maximum and sum; the logits chunk is reused. `backward()` scales them by the upstream gradient and adds them to the hidden states. If the head's weight needs a gradient, the backward pass recomputes each chunk's logits from the stored row statistics and accumulates `hiddenᵀ · gradient` (`multiplyTransposedA`); the bias gradient is collected during the forward pass. Because the gradient is computed as `exp(logit − max) / sum`, exactly like `crossEntropyLoss`, the fused and unfused results agree to within rounding.
+
+**What we looked for.** Loss and gradients (hidden states, weight, bias) equal to `Linear` followed by `crossEntropyLoss`, within 1 × 10⁻⁶, with masked rows; the same with an INT4 head; a 524,288-token vocabulary that forces several chunks; and `Transformer.loss` equal to `crossEntropyLoss(model.forward(…))`, including the adapter gradients, with and without the Vector API. A frozen head never allocates a weight gradient.
+
+**Results.** The output layer alone — projection and loss for 64 tokens, forward and backward, 896 × 151,936 weights, on the 2-core container used for all measurements in this section:
+
+| | Seconds |
+| :-- | --: |
+| 1.0.0 (unfused; the head's weight gradient always computed) | 2.7 |
+| 1.1.0, frozen head, all 64 tokens | 2.0 |
+| 1.1.0, frozen head, 18 response tokens | 0.70 |
+| 1.1.0 with the Vector API, all 64 tokens | 0.93 |
+| 1.1.0 with the Vector API, 18 response tokens | 0.33 |
+
+### 3. Frozen parameters and early backward termination
+
+**Files:** `Tensor.kt`, `Module.kt`, `LoRA.kt`, `AdamW.kt`, `SGD.kt`, `FineTuningPipeline.kt`, `Attention.kt`, `RMSNorm.kt`, `RoPE.kt`, `Embedding.kt`, `Loss.kt`.
+
+**What changed.**
+
+- `Tensor.requiresGrad`: leaves (parameters and inputs) start with `true`, and the result of an operation requires a gradient only if one of its inputs does. `Tensor.hasGrad` tells whether the gradient array has been allocated.
+- `Module.requiresGrad` reads or sets the flag of all of a module's parameters, so `module.requiresGrad = false` freezes it.
+- Every backward operation skips the gradient of an operand that does not require one: a frozen matmul weight gets no `Aᵀ · dC`, a frozen bias or norm weight no accumulation, attention no query or key gradient when neither is needed.
+- `backward()` only visits tensors that require a gradient, so a subgraph made only of frozen tensors is never entered.
+- `LoRAAdapter` freezes every base weight when it is attached and restores the flags in `merge()`. The new `blockIndices` parameter attaches adapters to selected blocks only, for example `LoRAAdapter(model, blockIndices = 20 until 24)`.
+- `AdamW` and `SGD` skip frozen tensors, and `zeroGrad()` no longer allocates gradient arrays that were never used.
+- `FineTuningPipeline` clears stray gradients only where they exist, instead of touching (and so allocating) every base weight's gradient.
+- `QuantizedEmbedding` outputs do not require gradients (their weights cannot be trained).
+
+**Why it was needed.** Only the adapters are trained, yet 1.0.0 computed the full weight gradient of every frozen projection — as much work as the input gradient itself — and then threw it away. Worse, every gradient computed allocated a gradient array the size of its weight, so LoRA training held two copies of the model: the 24-layer Qwen2-0.5B-shaped model ran out of a 6 GB heap in its first step.
+
+**How it works.** The flag is computed when a tensor is created, from its parents, so it costs one pass over two or three parents. The topological sort recurses only into parents that require a gradient. Inside each backward closure, every operand's gradient is guarded by its own flag, and the gradient arrays are only touched — and so allocated — when they are needed. With adapters on the query and value projections, the residual stream above the lowest adapted block still needs gradients, because it carries the loss back to the adapters below, but no frozen weight does; below the lowest adapted block, nothing does, and the backward pass never runs there.
+
+**What we looked for.** Adapter gradients identical whether the base is frozen or not (two identically seeded models), no gradient array ever allocated for a frozen weight, a probe closure in a frozen subgraph never called, blocks below the lowest adapter left out of the graph, frozen weights unchanged by `AdamW` with weight decay and by `SGD`, `merge()` restoring the flags, and every pre-existing test unchanged.
+
+### 4. Matrix-multiplication backward without transposed copies
+
+**Files:** `MatMul.kt` (`multiplyTransposedA`, `multiplyTransposedB`), `Tensor.kt`.
+
+**What changed.** `Tensor.matmul` back-propagates with `dA = dC · Bᵀ` through `MatMul.multiplyTransposedB` and `dB = Aᵀ · dC` through `MatMul.multiplyTransposedA`, both public, with the same `accumulate` / `alpha` options as `multiply`.
+
+**Why it was needed.** 1.0.0 transposed both operands into new arrays on every backward call: for Qwen's output head that was a 544 MB copy per step, just to put the data in the order the forward kernel expects.
+
+**How it works.** `Aᵀ · B` needs no copy at all: the tile kernel now reads its left operand through a row stride and a column stride, so a transposed `A` is just another pair of strides. `A · Bᵀ` is a matrix of dot products, which HotSpot does not vectorize; on the scalar path, `B` is therefore transposed one chunk at a time — at most 4 MB, in 32 × 32 cache blocks, spread over the worker threads — and each chunk goes through the vectorizable tile kernel. With the Vector API (see 5), `A · Bᵀ` is computed directly as SIMD dot products: 32-row by 64-column tiles, k in chunks of 1,024, four dot products per load of the `A` row.
+
+**What we looked for.** Equality with a naive product on odd shapes (1 × 1 × 1 up to 40 × 2,100 × 33, several k chunks), with accumulation and a negative `alpha`, in both backends; parallel results identical to serial ones; and the existing `matmul` gradient test unchanged. Throughput on 2 threads, in GFLOP/s, for the input gradient `dC · Bᵀ` of training-shaped products:
+
+| Product | 1.0.0 | 1.1.0 | 1.1.0 + Vector API |
+| :-- | --: | --: | --: |
+| [64 × 896] · [896 × 896]ᵀ | 19.9 | 20.7 | 57.1 |
+| [64 × 4,864] · [896 × 4,864]ᵀ | 19.3 | 23.5 | 73.7 |
+| [64 × 896] · [4,864 × 896]ᵀ | 20.4 | 25.8 | 75.1 |
+| [18 × 37,984] · [896 × 37,984]ᵀ (a quarter of Qwen's head) | 4.8 | 14.8 | 60.7 |
+
+### 5. Optional JVM Vector API backend
+
+**Files:** new `SimdKernels.kt`; `MatMul.kt`, `build.gradle.kts`, new `src/main/resources/META-INF/proguard/kotensor.pro`.
+
+**What changed.** `SimdKernels` implements the matmul inner loops — `y += a · x` for one or four rows, and one or four dot products — with `jdk.incubator.vector.FloatVector`, `SPECIES_PREFERRED` and fused multiply-add. `MatMul` loads it when the JVM has the `jdk.incubator.vector` module (JDK 17 or newer, started with `--add-modules jdk.incubator.vector`) and uses it in the tiled FP32 and dequantizing kernels, the quantized backward kernel and `A · Bᵀ`. `MatMul.vectorApiAvailable` reports whether it loaded, `MatMul.useVectorApi` turns it off and on at run time, and `-Dkotensor.vectorApi=false` keeps it from loading.
+
+**Why it was needed.** The C2 compiler auto-vectorizes `y[j] += a · x[j]` but never a floating-point reduction, because vectorizing it would reorder additions. Every dot product — the input gradient of every projection and the quantized backward kernel — therefore ran one float at a time. The Vector API states the vector operations explicitly, so the JIT emits AVX2 or AVX-512 (or NEON) instructions regardless.
+
+**How it works.** `MatMul` references the backend only through an internal interface and creates it by reflection after checking that `jdk.incubator.vector.FloatVector` resolves, then compares one `axpy` and one dot product with the scalar code before using it. Without the module, or on Android — whose runtime has no Vector API — nothing is loaded and the scalar kernels run exactly as before; the JAR carries a `-dontwarn jdk.incubator.vector.**` rule, so R8 builds of Android apps don't fail on the missing classes. The library is compiled with `-Xadd-modules=jdk.incubator.vector`, still against the Java 17 API. Single-row forward products — every decode step — always use the scalar kernels: they are bound by memory bandwidth, not arithmetic, and the Vector API's objects are only eliminated in fully optimized code, so running decode on it made a few bytes of allocation appear in 3 of 15 runs of the zero-allocation test.
+
+**What we looked for.** Every kernel with the Vector API agrees with the scalar kernel within 1 × 10⁻³ (tiled, single-row, dequantizing, quantized backward and `A · Bᵀ`); the whole suite passes in both modes; when the module is missing, `useVectorApi` stays `false` and cannot be turned on. `./gradlew test` now also runs the new `vectorApiTest` task, the same suite with the module added. On 2 threads the tiled matmul becomes 1.2–1.6× faster with the Vector API, and `A · Bᵀ` 1.8–4.1× faster (table in 4).
+
+### 6. Per-batch training telemetry
+
+**Files:** `FineTuningPipeline.kt`.
+
+**What changed.** `train(dataLoader, epochs, onBatchEnd, onEpochEnd)` calls `onBatchEnd(epoch, batch, totalBatches, loss)` after every batch, with 1-based batch numbers. A trailing lambda still binds to `onEpochEnd`, so existing calls compile unchanged. A batch whose targets are all masked is skipped without an optimizer step (`trainStep` returns 0) and left out of the epoch average.
+
+**Why it was needed.** A CPU epoch can take minutes, and with only an end-of-epoch callback nothing was printed in between, so training looked frozen — in Gradle runs especially. The callback is what a progress line such as `[Epoch 1/3 | Batch 45/150 | Loss: 2.14 | 30%]` needs.
+
+**What we looked for.** One report per batch with the right epoch, index and total; the epoch average; the trailing-lambda form; and a batch without targets leaving the adapter unchanged.
+
+### 7. Compatibility
+
+Version 1.1.0 is a drop-in replacement for 1.0.0, in source and in bytecode. The changed signatures keep their old forms: `crossEntropyLoss(logits, targets)` and `DataLoader(tokens, batchSize, sequenceLength)` through `@JvmOverloads`, `LoRAAdapter(model, rank, alpha)` through a secondary constructor, and `train(dataLoader, epochs, onEpochEnd)` through a hidden overload. A client compiled against 1.0.0 was run unchanged against 1.1.0 to confirm it.
+
+Behavior changes to be aware of: attaching a `LoRAAdapter` freezes the base weights until `merge()`, so their gradient arrays stay empty; optimizers ignore tensors whose `requiresGrad` is `false`; and the cross-entropy losses treat −100 as "ignore", which earlier versions rejected as out of range.
+
+### 8. Results
+
+LoRA fine-tuning steps measured with `FineTuningPipeline.trainStep` on random weights with Qwen2-0.5B's shape — dimension 896, 14 query / 2 key-value heads, feed-forward size 4,864, a 151,936-token vocabulary with a separate output head, rank-8 adapters on the query and value projections — and a batch of 64 tokens, of which the last 18 are response tokens when masked. The machine is a 2-core Intel Xeon container with AVX-512 running JDK 21 with a 6 GB heap; each figure is the mean of three steps after a warm-up step.
+
+| Seconds per step | 1.0.0 | 1.1.0 | 1.1.0, masked | 1.1.0 + Vector API | 1.1.0 + Vector API, masked |
+| :-- | --: | --: | --: | --: | --: |
+| 4 layers | 3.87 | 2.97 | 1.46 | 1.47 | 0.81 |
+| 8 layers | 4.84 | 3.95 | 2.07 | 2.05 | 1.19 |
+| 24 layers (full depth) | out of memory | 6.44 | 4.62 | 3.66 | 3.04 |
+
+| Heap after a step | 1.0.0 | 1.1.0 |
+| :-- | --: | --: |
+| 4 layers | 2.77 GB | 1.39 GB |
+| 8 layers | 3.35 GB | 1.68 GB |
+| 24 layers | more than 6 GB | 2.84 GB |
+
+The plan estimated 2.5–3.5 seconds per step for the full model once masking and the fused loss were in place (Milestone 6); on this 2-core machine the full model takes 3.0 seconds with the Vector API and 4.6 seconds without it. With the output layer fixed, the 24 frozen blocks are now the larger cost — about 0.11 (Vector API) to 0.17 seconds per block per step here, for their forward pass and the input gradient that has to flow through them to reach the adapters — which is what adapting only the top blocks with `blockIndices` avoids.
+
+---
+
 ## Cross-cutting changes
 
 ### Documentation
@@ -512,14 +642,15 @@ Every run includes JMH's `gc` profiler, which reports bytes allocated per operat
 - `README.md` was updated with each milestone and fully revised for v1.0.0: a new introduction and feature list, a "What's new" table, a quick start for running a pre-trained model, Maven Central coordinates in place of the old placeholders, Android requirements, and sections on the Android sample, benchmarks, API documentation and releasing. The public "Contributing" section was removed.
 - `Milestone.md` records the status of each milestone and how it was delivered.
 - `Module.md` (new) is the Dokka overview page, and this file is new.
+- For v1.1.0 the README gained sections on freezing, loss masking, training efficiency (with the measurements) and the Vector API backend, its API, limitation, test and benchmark tables were updated, and `Milestone.md` and `Module.md` record the new milestone and APIs.
 
 ### Code style
 
-From milestone 3 on, the code is written without comments or KDoc, following the project's no-comments rule. Comments from earlier milestones were removed in your own clean-up pass, and later write-backs restored the comment-free versions wherever a file had been regenerated. The files on disk are comment-free throughout.
+From milestone 3 on, the code is written without comments or KDoc, following the project's no-comments rule; the v1.1.0 code follows it too. Comments from earlier milestones were removed in your own clean-up pass, and later write-backs restored the comment-free versions wherever a file had been regenerated. The files on disk are comment-free throughout.
 
 ### Versions and coordinates
 
-The version went 0.1.0 → 0.2.0 → 0.3.0 → 0.4.0 → 0.5.0 → 1.0.0. The Maven coordinates changed from `com.github.TSPstudio:kotensor` to `io.github.tspstudio:kotensor`. The spec originally named `io.kotensor:kotensor`; the GitHub namespace was chosen because it is verified through the GitHub account rather than a domain (see *Maven Central publishing* under v1.0.0).
+The version went 0.1.0 → 0.2.0 → 0.3.0 → 0.4.0 → 0.5.0 → 1.0.0 → 1.1.0. The Maven coordinates changed from `com.github.TSPstudio:kotensor` to `io.github.tspstudio:kotensor`. The spec originally named `io.kotensor:kotensor`; the GitHub namespace was chosen because it is verified through the GitHub account rather than a domain (see *Maven Central publishing* under v1.0.0).
 
 ### Test suite growth
 
@@ -536,30 +667,22 @@ The version went 0.1.0 → 0.2.0 → 0.3.0 → 0.4.0 → 0.5.0 → 1.0.0. The Ma
 | `GQATest` | 6 | 0.4.0 | GQA equals replicated multi-head, gradients, all paths, rope scaling |
 | `HuggingFaceImportTest` | 7 | 0.4.0 | NumPy-reference logits, shards, biases, tied heads, dtypes, errors |
 | `QuantizationTest` | 11 | 0.5.0 | Error bounds, kernels, model paths, QLoRA, round trips, memory |
-| **Total** | **66** | | |
+| `TrainingTest` | 12 | 1.1.0 | Loss masking, fused loss, freezing and early termination, transposed kernels, Vector API vs scalar, data loading, telemetry |
+| **Total** | **78** | | |
 
 ---
 
 ## Known limitations and open items
 
-**Not yet run with Gradle.** The v1.0.0 build scripts, the Android module and the workflows were written against current official documentation but not executed. To check them:
-
-- `gradlew.bat test`
-- `gradlew.bat dokkaGenerate`
-- `gradlew.bat :benchmark:jmh`
-- `gradlew.bat -Pkotensor.android=true :sample-android:assembleDebug`
-
-**Before publishing:**
-
-- Add `ci.yml`, `docs.yml` and `release.yml` to `Kotensor/.github/workflows/` at the repository root.
-- Sign up for the Central Portal with the TSPstudio GitHub account, which verifies the `io.github.tspstudio` namespace.
-- Add the signing and portal secrets.
+**Build and release.** v1.0.0 was built, tested and published to Maven Central by the GitHub workflows. v1.1.0 adds `-Xadd-modules=jdk.incubator.vector` to the compiler options and a `vectorApiTest` task that `./gradlew test` runs after the regular tests, so CI and the release workflow check both backends.
 
 **Engine limitations that remain:**
 
 - Greedy decoding only; there is no temperature or top-k / top-p sampling.
 - Quantization is round-to-nearest per group, without calibration (GPTQ / AWQ), and GGUF files are not read.
-- LoRA covers the query and value projections only.
+- LoRA covers the query and value projections only, in all blocks or a chosen subset.
+- Loss masking applies to the loss: attention still sees masked tokens, and examples packed into one sequence can attend to earlier examples.
+- The Vector API backend needs `--add-modules jdk.incubator.vector` on JDK 17+, because the module is still incubating; Android always runs the scalar kernels.
 - The tokenizer handles byte-level BPE; SentencePiece-style tokenizers (Llama 2, Mistral) and pre-tokenizers other than `Split` and `ByteLevel` (such as `Digits`) are not supported.
 - The importer accepts the `llama`, `qwen2` and `mistral` architectures, and rejects others rather than guessing.
 - Performance was tuned on HotSpot; on Android, ART compiles the same code differently, so phone throughput should be measured with the sample app.

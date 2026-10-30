@@ -87,22 +87,26 @@ class RoPE(
 
         lateinit var out: Tensor
         out = Tensor(outData, input.shape.copyOf(), listOf(input)) {
-            for (t in 0 until tokens) {
-                val cacheOffset = t * halfDim
+            if (input.requiresGrad) {
+                val outGrad = out.grad
+                val inputGrad = input.grad
+                for (t in 0 until tokens) {
+                    val cacheOffset = t * halfDim
 
-                for (h in 0 until headsPerToken) {
-                    val headOffset = t * rowWidth + h * dimension
-                    for (i in 0 until halfDim) {
-                        val c = cosValues[cacheOffset + i]
-                        val s = sinValues[cacheOffset + i]
+                    for (h in 0 until headsPerToken) {
+                        val headOffset = t * rowWidth + h * dimension
+                        for (i in 0 until halfDim) {
+                            val c = cosValues[cacheOffset + i]
+                            val s = sinValues[cacheOffset + i]
 
-                        val idx1 = headOffset + i
-                        val idx2 = headOffset + i + halfDim
-                        val dy1 = out.grad[idx1]
-                        val dy2 = out.grad[idx2]
+                            val idx1 = headOffset + i
+                            val idx2 = headOffset + i + halfDim
+                            val dy1 = outGrad[idx1]
+                            val dy2 = outGrad[idx2]
 
-                        input.grad[idx1] += dy1 * c + dy2 * s
-                        input.grad[idx2] += -dy1 * s + dy2 * c
+                            inputGrad[idx1] += dy1 * c + dy2 * s
+                            inputGrad[idx2] += -dy1 * s + dy2 * c
+                        }
                     }
                 }
             }

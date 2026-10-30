@@ -34,12 +34,43 @@ class Transformer(
     }
 
     private fun forwardEmbedded(embedded: Tensor, sequenceLength: Int): Tensor {
+        return lmHead(encode(embedded, sequenceLength))
+    }
+
+    private fun encode(embedded: Tensor, sequenceLength: Int): Tensor {
         var x = embedded
         for (block in blocks) {
             x = block.forward(x, sequenceLength)
         }
-        val normed = finalNorm(x)
-        return lmHead(normed)
+        return finalNorm(x)
+    }
+
+    fun hiddenStates(input: Tensor): Tensor {
+        val sequenceLength = if (input.shape.size == 2) input.shape[1] else input.data.size
+        return encode(embedding(input), sequenceLength)
+    }
+
+    fun hiddenStates(indices: IntArray): Tensor {
+        return encode(embedding.forward(indices), indices.size)
+    }
+
+    @JvmOverloads
+    fun loss(input: Tensor, targets: Tensor, ignoreIndex: Int = IGNORE_INDEX): Tensor {
+        return lossFromHidden(hiddenStates(input), targetIndices(targets), ignoreIndex)
+    }
+
+    @JvmOverloads
+    fun loss(indices: IntArray, targets: IntArray, ignoreIndex: Int = IGNORE_INDEX): Tensor {
+        return lossFromHidden(hiddenStates(indices), targets, ignoreIndex)
+    }
+
+    private fun lossFromHidden(hidden: Tensor, targets: IntArray, ignoreIndex: Int): Tensor {
+        val head = lmHead
+        return if (head is Linear || head is QuantizedLinear) {
+            fusedCrossEntropyLoss(hidden, head, targets, ignoreIndex)
+        } else {
+            crossEntropyLoss(head(hidden), targets, ignoreIndex)
+        }
     }
 
     fun newCache(maxSequenceLength: Int): KVCache {

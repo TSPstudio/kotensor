@@ -30,7 +30,9 @@ jobs:
         if: always()
         with:
           name: test-report-${{ matrix.os }}
-          path: Engine/kotensor/build/reports/tests/test
+          path: |
+            Engine/kotensor/build/reports/tests/test
+            Engine/kotensor/build/reports/tests/vectorApiTest
 
   android-sample:
     runs-on: ubuntu-latest

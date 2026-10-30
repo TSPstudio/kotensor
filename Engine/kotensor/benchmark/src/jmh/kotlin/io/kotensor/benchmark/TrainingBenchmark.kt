@@ -1,6 +1,8 @@
 package io.kotensor.benchmark
 
 import io.kotensor.core.AdamW
+import io.kotensor.core.FineTuningPipeline
+import io.kotensor.core.IGNORE_INDEX
 import io.kotensor.core.LoRAAdapter
 import io.kotensor.core.Quantization
 import io.kotensor.core.Tensor
@@ -31,6 +33,8 @@ open class TrainingBenchmark {
     private lateinit var adapterOptimizer: AdamW
     private lateinit var inputs: Tensor
     private lateinit var targets: Tensor
+    private lateinit var pipeline: FineTuningPipeline
+    private lateinit var maskedTargets: Tensor
 
     @Setup
     fun setup() {
@@ -41,6 +45,10 @@ open class TrainingBenchmark {
         adapterOptimizer = AdamW(adapter.parameters(), learningRate = 1e-3f)
         inputs = Tensor(FloatArray(BATCH * SEQUENCE) { i -> ((i * 7) % Models.SMALL_VOCAB).toFloat() }, intArrayOf(BATCH, SEQUENCE))
         targets = Tensor(FloatArray(BATCH * SEQUENCE) { i -> ((i * 7 + 1) % Models.SMALL_VOCAB).toFloat() }, intArrayOf(BATCH, SEQUENCE))
+        val base = Models.small(seed = 3)
+        val loraAdapter = LoRAAdapter(base, rank = 8)
+        pipeline = FineTuningPipeline(base, loraAdapter, AdamW(loraAdapter.parameters(), learningRate = 1e-3f))
+        maskedTargets = Tensor(FloatArray(BATCH * SEQUENCE) { i -> if (i % SEQUENCE < 3 * SEQUENCE / 4) IGNORE_INDEX.toFloat() else targets.data[i] }, intArrayOf(BATCH, SEQUENCE))
     }
 
     @Benchmark
@@ -58,7 +66,17 @@ open class TrainingBenchmark {
         loss.backward()
         adapterOptimizer.step()
         adapterOptimizer.zeroGrad()
-        for (p in quantized.parameters()) p.grad.fill(0.0f)
+        for (p in quantized.parameters()) if (p.hasGrad) p.grad.fill(0.0f)
         blackhole.consume(loss.data[0])
+    }
+
+    @Benchmark
+    fun loraPipelineStep(blackhole: Blackhole) {
+        blackhole.consume(pipeline.trainStep(inputs, targets))
+    }
+
+    @Benchmark
+    fun maskedLoRAPipelineStep(blackhole: Blackhole) {
+        blackhole.consume(pipeline.trainStep(inputs, maskedTargets))
     }
 }

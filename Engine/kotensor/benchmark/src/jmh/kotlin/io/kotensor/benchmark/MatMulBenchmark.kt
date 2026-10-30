@@ -39,6 +39,8 @@ open class MatMulBenchmark {
     private lateinit var weightInt4: QuantizedTensor
     private lateinit var decodeOut: FloatArray
     private lateinit var prefillOut: FloatArray
+    private lateinit var prefillGrad: FloatArray
+    private lateinit var inputGrad: FloatArray
 
     @Setup
     fun setup() {
@@ -53,6 +55,8 @@ open class MatMulBenchmark {
         weightInt4 = QuantizedTensor.quantize(weight, DECODE_K, DECODE_N, Quantization.INT4)
         decodeOut = FloatArray(DECODE_N)
         prefillOut = FloatArray(PREFILL_M * DECODE_N)
+        prefillGrad = FloatArray(PREFILL_M * DECODE_N) { random.nextFloat() - 0.5f }
+        inputGrad = FloatArray(PREFILL_M * DECODE_K)
     }
 
     @Benchmark
@@ -67,6 +71,13 @@ open class MatMulBenchmark {
     fun prefillFp32(blackhole: Blackhole) {
         MatMul.multiply(prefillRows, weight, prefillOut, PREFILL_M, DECODE_K, DECODE_N, accumulate = false)
         blackhole.consume(prefillOut)
+    }
+
+    @Benchmark
+    @OperationsPerInvocation(PREFILL_FLOPS)
+    fun inputGradientFp32(blackhole: Blackhole) {
+        MatMul.multiplyTransposedB(prefillGrad, weight, inputGrad, PREFILL_M, DECODE_N, DECODE_K, accumulate = false)
+        blackhole.consume(inputGrad)
     }
 
     @Benchmark

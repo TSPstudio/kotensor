@@ -8,7 +8,15 @@ class Tensor (
     val parents: List<Tensor> = emptyList(),
     val backwardOp: () -> Unit = {}
 ){
-    val grad: FloatArray by lazy(LazyThreadSafetyMode.NONE) { FloatArray(data.size) }
+    var requiresGrad: Boolean = inheritsGrad(parents)
+
+    private var gradient: FloatArray? = null
+
+    val grad: FloatArray
+        get() = gradient ?: FloatArray(data.size).also { gradient = it }
+
+    val hasGrad: Boolean
+        get() = gradient != null
 
     init {
         var expectedSize = 1
@@ -25,9 +33,14 @@ class Tensor (
             val outData = FloatArray(data.size) { i -> data[i] + other.data[i] }
             lateinit var out: Tensor
             out = Tensor(outData, shape, listOf(this, other)) {
-                for (i in data.indices) {
-                    this.grad[i] += out.grad[i]
-                    other.grad[i] += out.grad[i]
+                val outGrad = out.grad
+                if (this.requiresGrad) {
+                    val g = this.grad
+                    for (i in data.indices) g[i] += outGrad[i]
+                }
+                if (other.requiresGrad) {
+                    val g = other.grad
+                    for (i in data.indices) g[i] += outGrad[i]
                 }
             }
             return out
@@ -46,14 +59,7 @@ class Tensor (
                 }
                 lateinit var out: Tensor
                 out = Tensor(outData, this.shape.copyOf(), listOf(this, other)) {
-                    for (r in 0 until rows) {
-                        val rowOffset = r * cols
-                        for (c in 0 until cols) {
-                            val g = out.grad[rowOffset + c]
-                            this.grad[rowOffset + c] += g
-                            other.grad[c] += g
-                        }
-                    }
+                    accumulateBroadcast(out.grad, this, other, rows, cols)
                 }
                 return out
             } else if (this.shape[0] == 1) {
@@ -68,14 +74,7 @@ class Tensor (
                 }
                 lateinit var out: Tensor
                 out = Tensor(outData, other.shape.copyOf(), listOf(this, other)) {
-                    for (r in 0 until rows) {
-                        val rowOffset = r * cols
-                        for (c in 0 until cols) {
-                            val g = out.grad[rowOffset + c]
-                            this.grad[c] += g
-                            other.grad[rowOffset + c] += g
-                        }
-                    }
+                    accumulateBroadcast(out.grad, other, this, rows, cols)
                 }
                 return out
             }
@@ -89,9 +88,14 @@ class Tensor (
         val outData = FloatArray(data.size) { i -> data[i] - other.data[i] }
         lateinit var out: Tensor
         out = Tensor(outData,shape,listOf(this, other)){
-            for(i in data.indices){
-                this.grad[i] += out.grad[i]
-                other.grad[i] += -(out.grad[i])
+            val outGrad = out.grad
+            if (this.requiresGrad) {
+                val g = this.grad
+                for (i in data.indices) g[i] += outGrad[i]
+            }
+            if (other.requiresGrad) {
+                val g = other.grad
+                for (i in data.indices) g[i] += -(outGrad[i])
             }
         }
         return out
@@ -102,9 +106,14 @@ class Tensor (
         val outData = FloatArray(data.size) { i -> data[i] * other.data[i] }
         lateinit var out: Tensor
         out = Tensor(outData,shape,listOf(this, other)){
-            for(i in data.indices){
-                this.grad[i] += out.grad[i] * other.data[i]
-                other.grad[i] += out.grad[i] * this.data[i]
+            val outGrad = out.grad
+            if (this.requiresGrad) {
+                val g = this.grad
+                for (i in data.indices) g[i] += outGrad[i] * other.data[i]
+            }
+            if (other.requiresGrad) {
+                val g = other.grad
+                for (i in data.indices) g[i] += outGrad[i] * this.data[i]
             }
         }
         return out
@@ -114,8 +123,10 @@ class Tensor (
         val outData = FloatArray(data.size) { i -> data[i] * scalar }
         lateinit var out: Tensor
         out = Tensor(outData, shape.copyOf(), listOf(this)) {
-            for (i in data.indices) {
-                this.grad[i] += out.grad[i] * scalar
+            if (this.requiresGrad) {
+                val outGrad = out.grad
+                val g = this.grad
+                for (i in data.indices) g[i] += outGrad[i] * scalar
             }
         }
         return out
@@ -134,14 +145,12 @@ class Tensor (
 
         lateinit var out: Tensor
         out = Tensor(outData, outShape, listOf(this, other)) {
-
-            val otherT = FloatArray(k * n)
-            MatMul.transpose(other.data, k, n, otherT)
-            MatMul.multiply(out.grad, otherT, this.grad, m, n, k)
-
-            val thisT = FloatArray(m * k)
-            MatMul.transpose(this.data, m, k, thisT)
-            MatMul.multiply(thisT, out.grad, other.grad, k, m, n)
+            if (this.requiresGrad) {
+                MatMul.multiplyTransposedB(out.grad, other.data, this.grad, m, n, k)
+            }
+            if (other.requiresGrad) {
+                MatMul.multiplyTransposedA(this.data, out.grad, other.grad, k, m, n)
+            }
         }
         return out
     }
@@ -157,7 +166,9 @@ class Tensor (
 
         lateinit var out: Tensor
         out = Tensor(outData, intArrayOf(m, n), listOf(this)) {
-            MatMul.multiplyByQuantizedTransposed(out.grad, weight, this.grad, m)
+            if (this.requiresGrad) {
+                MatMul.multiplyByQuantizedTransposed(out.grad, weight, this.grad, m)
+            }
         }
         return out
     }
@@ -231,8 +242,10 @@ class Tensor (
         val outData = data.copyOf()
         lateinit var out: Tensor
         out = Tensor(outData, newShape, listOf(this)){
-            for(i in data.indices){
-                this.grad[i] += out.grad[i]
+            if (this.requiresGrad) {
+                val outGrad = out.grad
+                val g = this.grad
+                for (i in data.indices) g[i] += outGrad[i]
             }
         }
         return out
@@ -253,9 +266,13 @@ class Tensor (
 
         lateinit var out: Tensor
         out = Tensor(outData, outShape, listOf(this)){
-            for(i in 0 until m){
-                for(j in 0 until n){
-                    this.grad[i * n + j] += out.grad[j * m + i]
+            if (this.requiresGrad) {
+                val outGrad = out.grad
+                val g = this.grad
+                for(i in 0 until m){
+                    for(j in 0 until n){
+                        g[i * n + j] += outGrad[j * m + i]
+                    }
                 }
             }
         }
@@ -263,12 +280,15 @@ class Tensor (
     }
 
     fun backward(){
+        if (!requiresGrad) return
         val topology = mutableListOf<Tensor>()
         val visited = mutableSetOf<Tensor>()
 
         fun buildTopology(v: Tensor){
             if(visited.add(v)){
-                v.parents.forEach {v -> buildTopology(v)}
+                for (parent in v.parents) {
+                    if (parent.requiresGrad) buildTopology(parent)
+                }
                 topology.add(v)
             }
         }
@@ -284,9 +304,13 @@ class Tensor (
         val outData = FloatArray(data.size){i -> if(data[i] > 0f) data[i] else 0f}
         lateinit var out: Tensor
         out = Tensor(outData, shape, listOf(this)){
-            for(i in data.indices){
-                if(data[i] > 0f){
-                    this.grad[i] += out.grad[i]
+            if (this.requiresGrad) {
+                val outGrad = out.grad
+                val g = this.grad
+                for(i in data.indices){
+                    if(data[i] > 0f){
+                        g[i] += outGrad[i]
+                    }
                 }
             }
         }
@@ -304,10 +328,14 @@ class Tensor (
         }
         lateinit var out: Tensor
         out = Tensor(outData, shape, listOf(this)){
-            for(i in data.indices){
-                val s = sigmoids[i]
-                val rate = s * (1.0f + data[i] * (1.0f - s))
-                this.grad[i] += out.grad[i] * rate
+            if (this.requiresGrad) {
+                val outGrad = out.grad
+                val g = this.grad
+                for(i in data.indices){
+                    val s = sigmoids[i]
+                    val rate = s * (1.0f + data[i] * (1.0f - s))
+                    g[i] += outGrad[i] * rate
+                }
             }
         }
         return out
@@ -326,16 +354,43 @@ class Tensor (
         }
         lateinit var out: Tensor
         out = Tensor(outData, shape, listOf(this)){
-            for(i in data.indices){
-                val x = data[i]
-                val t = tanhValues[i]
-                val sech2 = 1.0f - t * t
-                val dInner = constant * (1.0f + 3.0f * 0.044715f * x * x)
-                val rate = 0.5f * (1.0f + t) + 0.5f * x * sech2 * dInner
-                this.grad[i] += out.grad[i] * rate
+            if (this.requiresGrad) {
+                val outGrad = out.grad
+                val g = this.grad
+                for(i in data.indices){
+                    val x = data[i]
+                    val t = tanhValues[i]
+                    val sech2 = 1.0f - t * t
+                    val dInner = constant * (1.0f + 3.0f * 0.044715f * x * x)
+                    val rate = 0.5f * (1.0f + t) + 0.5f * x * sech2 * dInner
+                    g[i] += outGrad[i] * rate
+                }
             }
         }
         return out
     }
 }
 
+private fun inheritsGrad(parents: List<Tensor>): Boolean {
+    if (parents.isEmpty()) return true
+    for (i in parents.indices) {
+        if (parents[i].requiresGrad) return true
+    }
+    return false
+}
+
+private fun accumulateBroadcast(outGrad: FloatArray, full: Tensor, row: Tensor, rows: Int, cols: Int) {
+    if (full.requiresGrad) {
+        val g = full.grad
+        for (i in 0 until rows * cols) g[i] += outGrad[i]
+    }
+    if (row.requiresGrad) {
+        val g = row.grad
+        for (r in 0 until rows) {
+            val rowOffset = r * cols
+            for (c in 0 until cols) {
+                g[c] += outGrad[rowOffset + c]
+            }
+        }
+    }
+}
