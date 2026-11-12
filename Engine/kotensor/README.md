@@ -13,10 +13,10 @@
 <p align="center">
   <img alt="Kotlin 2.3.20" src="https://img.shields.io/badge/Kotlin-2.3.20-364FC7?style=flat-square&logo=kotlin&logoColor=white">
   <img alt="JVM 17+" src="https://img.shields.io/badge/JVM-17%2B-16151C?style=flat-square">
-  <img alt="Android API 26+" src="https://img.shields.io/badge/Android-API%2026%2B-364FC7?style=flat-square&logo=android&logoColor=white">
+  <img alt="Android API 24+" src="https://img.shields.io/badge/Android-API%2024%2B-364FC7?style=flat-square&logo=android&logoColor=white">
   <a href="https://central.sonatype.com/artifact/io.github.tspstudio/kotensor"><img alt="Maven Central" src="https://img.shields.io/maven-central/v/io.github.tspstudio/kotensor?style=flat-square&color=364FC7"></a>
   <a href="https://tspstudio.github.io/kotensor/"><img alt="API docs" src="https://img.shields.io/badge/docs-API-16151C?style=flat-square"></a>
-  <img alt="Tests: 78 passing" src="https://img.shields.io/badge/tests-78%20passing-16151C?style=flat-square">
+  <img alt="Tests: 124 passing" src="https://img.shields.io/badge/tests-124%20passing-16151C?style=flat-square">
   <img alt="Runtime dependencies: Kotlin stdlib only" src="https://img.shields.io/badge/runtime%20deps-stdlib%20only-364FC7?style=flat-square">
   <img alt="License: Apache 2.0" src="https://img.shields.io/badge/license-Apache%202.0-16151C?style=flat-square">
 </p>
@@ -33,15 +33,15 @@ Kotensor implements the whole stack — tensors, reverse-mode autograd, optimize
 
 - **Trains, not just infers.** Every op records its backward pass; `backward()` runs reverse-mode autograd over the graph.
 - **Modern Transformer blocks.** RMSNorm, rotary position embeddings (with Llama 3 scaling), SwiGLU feed-forward and causal multi-head or grouped-query attention in a pre-norm layout.
-- **Fast autoregressive decoding.** A pre-allocated `KVCache` turns generation from re-running the whole sequence per token into a single-token step, and `Transformer.decode` runs that step with zero heap allocations.
+- **Fast autoregressive decoding.** A pre-allocated `KVCache` turns generation from re-running the whole sequence per token into a single-token step, and `Transformer.decode` runs that step with zero heap allocations. The prompt is prefilled through a few MB of reusable buffers, however long it is, attention runs on every core, and a cached system prompt is reused instead of recomputed.
 - **Multi-core, vectorized matmul.** `MatMul` tiles the product for the cache, accumulates in a form HotSpot auto-vectorizes, and spreads tiles over a `ForkJoinPool` — still plain Kotlin. On JDK 17+, an optional JVM Vector API backend adds explicit SIMD fused multiply-add kernels.
 - **Real vocabularies.** `BPETokenizer` loads Hugging Face `tokenizer.json` files (byte-level BPE: GPT-2, Qwen 2.5, SmolLM, Llama 3) with no JSON library, with `<|endoftext|>` / `<|im_start|>` / `<|im_end|>` support.
 - **Runs Hugging Face checkpoints.** `HuggingFaceModelLoader.load(directory)` reads `config.json` and `.safetensors` shards (BF16/F16/F32) of Llama-, Qwen2- and Mistral-architecture models — grouped-query attention, tied embeddings and Llama 3 rope scaling included — into a Kotensor `Transformer`.
-- **INT8 / INT4 on the edge.** Group-wise weight-only quantization with an on-the-fly dequantizing matmul: a 163M-parameter model drops from 652 MB to 173 MB (INT8) or 95 MB (INT4), saves to a compact file that loads without FP32 copies, and still trains LoRA adapters on top.
+- **INT8 / INT4 on the edge.** Group-wise weight-only quantization with an on-the-fly dequantizing matmul: a 163M-parameter model drops from 652 MB to 173 MB (INT8) or 95 MB (INT4), saves to a compact file that loads without FP32 copies — or is memory-mapped, so the weights never enter the Java heap — and still trains LoRA adapters on top.
 - **Parameter-efficient fine-tuning.** `LoRAAdapter` adds small low-rank matrices to the attention projections and freezes the base weights — FP32 or quantized (QLoRA).
 - **Lean training steps.** Autograd skips frozen weights (`requiresGrad`), prompt tokens can be masked out of the loss (`IGNORE_INDEX`), and the output projection and cross-entropy run as one fused pass that never materializes the `[tokens × vocabulary]` logits — half the memory of 1.0.0 and LoRA steps up to 4.8× faster ([measurements](#training-efficiency)).
 - **Interoperable weights.** Reads `.safetensors` in F32, F16 and BF16 (including sharded checkpoints), writes F32 checkpoints and compact quantized model files.
-- **Runs on Android.** Java 17 bytecode, Android 8.0+ (API 26), no native libraries; the `:sample-android` app streams, quantizes and fine-tunes on the phone.
+- **Runs on Android.** Java 17 bytecode, Android 7.0+ (API 24), no native libraries; the `:sample-android` app streams, quantizes and fine-tunes on the phone. With memory-mapped weights, an INT4 Qwen2-0.5B answers in under 128 MB of heap ([low-memory inference](#low-memory-inference)).
 - **Measured and documented.** A JMH suite for FLOP/s, tokens/s and allocations, Dokka API pages, and a Maven Central release pipeline.
 
 ## What's new since 0.1.0
@@ -54,6 +54,7 @@ Kotensor implements the whole stack — tensors, reverse-mode autograd, optimize
 | 0.5.0 | INT8 / INT4 group-wise quantization with a dequantizing matmul; QLoRA; compact model files; lazily allocated gradients |
 | 1.0.0 | Android-ready Java 17 build; Compose sample app; Dokka docs; Maven Central publishing; JMH benchmarks; CI workflows |
 | 1.1.0 | Training efficiency: loss masking with `IGNORE_INDEX`; fused output projection + cross-entropy; `requiresGrad` freezing with early backward termination; matmul backward without transposed copies; optional JVM Vector API (SIMD) kernels; per-batch training telemetry |
+| 1.2.0 | Low-memory inference: buffered prompt prefill that never builds a graph and computes the output layer for the last token only; `noGrad`; memory-mapped quantized model files (`loadQuantized(file, memoryMapped = true)`); embeddings tied to the output head, stored once; parallel attention; a reworked single-row quantized kernel, 2.8–4× faster on a phone, with configurable threads and a per-VM INT4 default; sampling (temperature, top-k, top-p, repetition penalty); prompt prefix reuse (`cachePrefix`); Android 7 (API 24) support |
 
 [`CHANGELOG.md`](CHANGELOG.md) explains each change, why it was needed and how it was verified.
 
@@ -67,6 +68,7 @@ Kotensor implements the whole stack — tensors, reverse-mode autograd, optimize
 - [Usage guide](#usage-guide)
   - [Training efficiency](#training-efficiency)
   - [Vector API (SIMD) backend](#vector-api-simd-backend)
+  - [Low-memory inference](#low-memory-inference)
 - [API overview](#api-overview)
 - [Current limitations](#current-limitations)
 - [Architecture](#architecture)
@@ -82,10 +84,10 @@ Kotensor implements the whole stack — tensors, reverse-mode autograd, optimize
 ## Installation
 
 > **Requirements:** Java 17 or newer. The library is compiled to Java 17 bytecode against the Java 17 API (it is built with a Java 21 toolchain), and its only runtime dependency is the Kotlin standard library.
-> **Android:** API 26 (Android 8.0) and newer. There are no native libraries, so there is no ABI split; [`:sample-android`](#android-sample) is a working Compose app built on it. The JAR carries its own R8 rule, so minified builds need no extra configuration.
+> **Android:** API 24 (Android 7.0) and newer. There are no native libraries, so there is no ABI split; [`:sample-android`](#android-sample) is a working Compose app built on it. The JAR carries its own R8 rule, so minified builds need no extra configuration. Load models of more than a few tens of MB [memory-mapped](#low-memory-inference), so their weights don't count toward the app's heap limit.
 > **Optional SIMD:** on JDK 17+, start the JVM with `--add-modules jdk.incubator.vector` to enable the [Vector API backend](#vector-api-simd-backend).
 
-Kotensor is published on [Maven Central](https://central.sonatype.com/artifact/io.github.tspstudio/kotensor) as `io.github.tspstudio:kotensor:1.1.0`. The API reference is at [tspstudio.github.io/kotensor](https://tspstudio.github.io/kotensor/).
+Kotensor is published on [Maven Central](https://central.sonatype.com/artifact/io.github.tspstudio/kotensor) as `io.github.tspstudio:kotensor:1.2.0`. The API reference is at [tspstudio.github.io/kotensor](https://tspstudio.github.io/kotensor/).
 
 ### Gradle (Kotlin DSL)
 
@@ -95,7 +97,7 @@ repositories {
 }
 
 dependencies {
-    implementation("io.github.tspstudio:kotensor:1.1.0")
+    implementation("io.github.tspstudio:kotensor:1.2.0")
 }
 ```
 
@@ -105,7 +107,7 @@ dependencies {
 <dependency>
   <groupId>io.github.tspstudio</groupId>
   <artifactId>kotensor</artifactId>
-  <version>1.1.0</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 
@@ -388,7 +390,23 @@ model.generateStream("h", tokenizer, maxTokens = 32) { piece -> print(piece) }
 model.generate(prompt, maxTokens = 256, stopTokens = setOfNotNull(tokenizer.endOfTextId))
 ```
 
-Generation runs through a **KV cache**: the prompt is prefilled in one pass, and every further step feeds back only the token just produced, attending to the cached keys and values. A step therefore costs O(position) instead of re-running the whole sequence, and the output is the same as the uncached forward pass. Those steps go through `decode`, which keeps every intermediate in a pre-allocated `InferenceBuffers` — no heap allocation per token, so the garbage collector stays idle while text streams. Text streaming decodes incrementally, so a character spread over several byte-level tokens is delivered once it is complete.
+Generation runs through a **KV cache**: the prompt is prefilled first — 32 tokens at a time through reusable buffers, computing the output layer for the last prompt token only — and every further step feeds back only the token just produced, attending to the cached keys and values. A step therefore costs O(position) instead of re-running the whole sequence, and the output is the same as the uncached forward pass. Those steps go through `decode`, which keeps every intermediate in a pre-allocated `InferenceBuffers` — no heap allocation per token, so the garbage collector stays idle while text streams. Text streaming decodes incrementally, so a character spread over several byte-level tokens is delivered once it is complete.
+
+A chat app sends the same system prompt with every message. Cache it once and pass it to `generate` / `generateStream`; the positions that match the start of the prompt are copied instead of recomputed, and the output is the same as without the prefix:
+
+```kotlin
+val system = model.cachePrefix(tokenizer.encode("<|im_start|>system\nYou are a helpful tutor."))
+val reply = model.generateStream(tokenizer.encode(fullPrompt), maxTokens = 128, stopTokens = stops, prefix = system)
+```
+
+Generation is greedy unless you pass a `Sampling`:
+
+```kotlin
+val sampling = Sampling(temperature = 0.7f, topK = 40, topP = 0.9f, repetitionPenalty = 1.1f, repetitionWindow = 64)
+val varied = model.generateStream(tokenizer.encode(fullPrompt), maxTokens = 128, stopTokens = stops, sampling = sampling)
+```
+
+The repetition penalty covers the last `repetitionWindow` tokens of the prompt and of the generated text. `Sampling.GREEDY` is the default behavior, and a `seed` makes a sampled run repeatable.
 
 To drive the cache yourself (for example to keep a conversation's context between turns):
 
@@ -396,14 +414,15 @@ To drive the cache yourself (for example to keep a conversation's context betwee
 val cache = model.newCache(maxSequenceLength = 512)   // [layers, heads, 512, headDim] × keys and values
 val buffers = model.newInferenceBuffers(maxSequenceLength = 512)
 
-var logits = model.forward(promptTokens, cache)        // prefill; cache.length == promptTokens.size
+var logits = model.prefill(promptTokens, cache, buffers)   // buffers.logits for the last prompt token; cache.length == promptTokens.size
 logits = model.decode(nextToken, cache, buffers)       // one allocation-free step → buffers.logits, shaped [1, vocabularySize]
 logits = model.forward(intArrayOf(nextToken), cache)   // the same step through the graph path (allocates)
 cache.remaining                                        // positions left before it is full
+other.copyFrom(cache, length = 10)                     // the first 10 positions into another cache of the same model
 cache.reset()                                          // start a new sequence
 ```
 
-`forward(indices, cache)` and `decode` are inference-only: no gradient is recorded through the cache. `decode` returns `buffers.logits` itself, so read it before the next call.
+`prefill`, `forward(indices, cache)` and `decode` are inference-only: no gradient is recorded through the cache. `forward(promptTokens, cache)` still prefills too, but returns the logits of every position, so it allocates `[tokens × vocabulary]` floats; `prefill` keeps only the last row. `prefill` and `decode` return `buffers.logits` itself, so read it before the next call.
 
 ### Saving and loading weights
 
@@ -553,6 +572,7 @@ model.weightBytes()                                         // bytes held by the
 val compact = HuggingFaceModelLoader.load(directory, Quantization.INT4)   // quantize while importing
 compact.saveQuantized(File("model-int4.safetensors"))
 val onDevice = Transformer.loadQuantized(File("model-int4.safetensors"))  // never allocates FP32 weights
+val mapped = Transformer.loadQuantized(File("model-int4.safetensors"), memoryMapped = true)   // weights stay in the file, off the heap
 ```
 
 | | bytes per weight | scheme |
@@ -563,7 +583,47 @@ val onDevice = Transformer.loadQuantized(File("model-int4.safetensors"))  // nev
 
 `Quantization(bits, groupSize)` picks the group size (smaller groups: more accurate, slightly larger). `QuantizedLinear` and `QuantizedEmbedding` behave like `Linear` / `Embedding` in every path — graph forward, cached forward, allocation-free `decode` — and `QuantizedTensor.quantize` / `dequantize` are available directly. A quantized model can't be trained (its weights are frozen) except through LoRA adapters.
 
-Measured on a SmolLM2-135M-shaped model (163 M parameters, 2-core container): FP32 652 MB at 8.6 tokens/s, INT8 173 MB at 12.2 tokens/s, INT4 95 MB at 8.0 tokens/s. The INT4 kernel is compute-bound on unpacking nibbles, so it trades a little speed for a 7× smaller footprint.
+Measured on a SmolLM2-135M-shaped model (163 M parameters, 2-core container): FP32 652 MB at 8.6 tokens/s, INT8 173 MB at 12.2 tokens/s, INT4 95 MB at 8.0 tokens/s. The INT4 kernel is compute-bound on unpacking nibbles, so it trades a little speed for a 7× smaller footprint. That is HotSpot; on Android the single-row INT4 kernel uses a lookup table instead of unpacking by default (`MatMul.lookupInt4`), because ART converts bytes to floats slowly.
+
+### Low-memory inference
+
+Android caps each app's Java heap — typically at 256 or 512 MB even with `android:largeHeap`, however much RAM the phone has — and every weight array counts toward it. Three features keep inference inside that limit:
+
+```kotlin
+val model = Transformer.loadQuantized(File(context.filesDir, "model-int4.safetensors"), memoryMapped = true)
+model.namedQuantizedTensors().values.all { it.isMemoryMapped }   // true: the weights stay in the file
+
+val reply = model.generate(promptTokens, maxTokens = 128, stopTokens = setOfNotNull(tokenizer.imEndId))
+```
+
+- **Memory-mapped model files.** `loadQuantized(file, memoryMapped = true)` maps the packed weights, scales and zero points of a `saveQuantized` file instead of copying them into arrays; only norm weights and biases go on the heap. The operating system pages the weights in as they are used and can drop them again under memory pressure. Output and decoding speed are identical to a heap-loaded model. Reading `qdata`, `scales` or `zeros` of a mapped tensor copies that tensor onto the heap. Don't overwrite the file in place while a model maps it: write a new file and rename it over the old one.
+- **Buffered prompt prefill.** `generate`, `generateStream` and `StreamingSession` run the prompt through `prefill`, so its memory doesn't grow with the prompt: about 2 MB for Qwen2-0.5B, where 1.1.0 held about 5 MB per prompt token until the first generated token.
+- **`noGrad`.** Inference through the graph API — `model.forward(tokens)` to score text, for example — still records an autograd graph that holds every intermediate. Inside `noGrad`, results keep no reference to their inputs, so each one is released as soon as it has been used:
+
+```kotlin
+val logits = noGrad { model.forward(tokens) }
+```
+
+- **Tied embeddings.** Models with `tie_word_embeddings` (Qwen2-0.5B and SmolLM2, for example) share one matrix between the token embedding and the output layer, but the importer keeps two copies. `tieEmbeddingToHead()` makes the embedding read the columns of the quantized output head, and `saveQuantized` then stores the matrix once; `loadQuantized` restores the tie. The head's quantization groups along the other axis, so the input embeddings change slightly — compare the model's answers before shipping a tied file.
+
+```kotlin
+Transformer.loadQuantized(File("model-int4.safetensors"))
+    .tieEmbeddingToHead()
+    .saveQuantized(File("model-int4-tied.safetensors"))
+```
+
+Measured with an INT4 Qwen2-0.5B fine-tune (366 MB file) on JDK 21, 2-core container:
+
+| | 1.1.0 | 1.2.0 | 1.2.0, mapped | 1.2.0, mapped and tied |
+| :-- | --: | --: | --: | --: |
+| Heap limit it runs in | out of memory at 512 MB | 512 MB | 128 MB | 128 MB |
+| Heap held by the model | 350 MB | 350 MB | 3 MB | 3 MB |
+| First token (75-token prompt) | 5.2 s | 2.6 s | 2.9 s | 3.2 s |
+| First token (367-token prompt) | 24.0 s | 10.3 s | 11.3 s | 10.5 s |
+| Each decoded token | 0.19 s | 0.15 s | 0.15 s | 0.15 s |
+| File size | 366 MB | 366 MB | 366 MB | 288 MB |
+
+Only the KV cache grows with the conversation: 24 KB per token of context for this model, so 1,600 tokens add 39 MB. Time grows faster than memory — a 1,600-token prompt takes 60 s to its first token on that container (81 s before attention ran on every core) — so on a phone, keep prompts short and stream the reply. The first answer after a mapped file has left the page cache also includes reading it from storage.
 
 ### Streaming generation with telemetry
 
@@ -586,20 +646,21 @@ session.cancel()   // safe to call from another thread; stops before the next to
 
 | Area | Type / function | Purpose |
 | :-- | :-- | :-- |
-| Core | `Tensor` | Data, shape, lazily allocated gradient, `requiresGrad` / `hasGrad`, ops, in-place ops and `backward()` |
-| | `MatMul` | Tiled / striped, auto-vectorized, multi-threaded FP32 and dequantizing matmul kernels, `Aᵀ · B` / `A · Bᵀ` variants, transpose, optional Vector API backend (`useVectorApi`) |
-| | `Quantization`, `QuantizedTensor` | INT8 / INT4 group-wise weight quantization |
+| Core | `Tensor`, `noGrad` | Data, shape, lazily allocated gradient, `requiresGrad` / `hasGrad`, ops, in-place ops and `backward()`; `noGrad { }` runs a block without recording the graph |
+| | `MatMul` | Tiled / striped, auto-vectorized, multi-threaded FP32 and dequantizing matmul kernels, `Aᵀ · B` / `A · Bᵀ` variants, transpose, optional Vector API backend (`useVectorApi`), a thread count that can change at runtime (`numThreads`) and the INT4 single-row kernel choice (`lookupInt4`) |
+| | `Quantization`, `QuantizedTensor` | INT8 / INT4 group-wise weight quantization, on the heap or memory-mapped (`isMemoryMapped`); `dequantizeRow` / `dequantizeColumn` |
 | | `Module` | Base class: `forward`, `parameters`, `invoke`, `requiresGrad` |
 | Layers | `Projection`, `Linear`, `QuantizedLinear` | Affine layers, FP32 or quantized; `forwardInto` |
-| | `TokenEmbedding`, `Embedding`, `QuantizedEmbedding` | Token-index lookup tables; `lookupInto` |
+| | `TokenEmbedding`, `Embedding`, `QuantizedEmbedding`, `TiedQuantizedEmbedding` | Token-index lookup tables (the tied one reads the quantized output head); `lookupInto` |
 | | `RMSNorm` | Root-mean-square normalization with a learned scale; `forwardInto` |
-| | `RoPE`, `RoPEScaling` | Rotary position embeddings (`apply(input, startPosition)`), per head, with optional Llama 3 frequency scaling; `applyInPlace` |
+| | `RoPE`, `RoPEScaling` | Rotary position embeddings (`apply(input, startPosition)`), per head, with optional Llama 3 frequency scaling; `applyInPlace` / `applyRowsInPlace` |
 | | `SwiGLU` | Gated feed-forward network (`wGate`, `wUp`, `wDown`); `forwardInto` |
-| | `Attention` | Causal multi-head / grouped-query self-attention: full-sequence, cached, or allocation-free `decodeInto` |
+| | `Attention` | Causal multi-head / grouped-query self-attention: full-sequence, cached, buffered prefill, or allocation-free `decodeInto` |
 | | `TransformerBlock` | Pre-norm attention + SwiGLU block; `decodeInto` |
-| | `Transformer` | Decoder-only model: forward, `hiddenStates`, fused `loss`, cached generation, `decode`, named weights, `quantize`, `saveQuantized` / `loadQuantized` |
-| | `KVCache` | Pre-allocated `[layers, heads, maxSequenceLength, headDim]` key/value buffers |
-| | `InferenceBuffers` | Pre-allocated activations for `decode` |
+| | `Transformer` | Decoder-only model: forward, `hiddenStates`, fused `loss`, cached generation (optionally from a `PromptPrefix`), `prefill`, `decode`, `cachePrefix`, named weights, `quantize`, `tieEmbeddingToHead`, `saveQuantized` / `loadQuantized` (on the heap or memory-mapped) |
+| | `KVCache`, `PromptPrefix` | Pre-allocated `[layers, heads, maxSequenceLength, headDim]` key/value buffers, `copyFrom`; a cached prompt opening (`cachePrefix`) that generation reuses |
+| | `InferenceBuffers` | Pre-allocated activations for `decode` and the last-token output of `prefill` |
+| | `Sampling`, `Sampler` | Temperature, top-k, top-p and repetition-penalty settings for `generate` / `generateStream` / `StreamingSession.stream`; `Sampling.GREEDY` |
 | Losses | `mseLoss(prediction, target)` | Mean squared error |
 | | `crossEntropyLoss(logits, targets, ignoreIndex)` | Softmax cross-entropy; targets as `IntArray` or `Tensor`; rows labelled `IGNORE_INDEX` (−100) are skipped |
 | | `fusedCrossEntropyLoss(hidden, head, targets, ignoreIndex)` | Output projection + masked cross-entropy in one chunked pass, without materializing the logits |
@@ -609,7 +670,7 @@ session.cancel()   // safe to call from another thread; stops before the next to
 | | `BPETokenizer` | Byte-level BPE from Hugging Face `tokenizer.json`, special tokens |
 | | `IncrementalDecoder` | Streams decoded text, holding back incomplete multi-byte characters |
 | | `DataLoader` | Sequential next-token batches; optional `labels` for loss masking, `promptMasked` for (prompt, response) pairs |
-| I/O | `SafeTensors`, `SafeTensorsFile`, `SafeTensorsEntry` | `save` / `saveEntries` (any dtype, metadata) / `load` / `open` with per-tensor and raw reads, F16 / BF16 / F64 conversion |
+| I/O | `SafeTensors`, `SafeTensorsFile`, `SafeTensorsEntry` | `save` / `saveEntries` (any dtype, metadata) / `load` / `open` with per-tensor and raw reads, memory-mapped `map`, F16 / BF16 / F64 conversion |
 | | `HuggingFaceModelLoader`, `HuggingFaceConfig`, `ImportReport` | `config.json` + `.safetensors` (sharded) importer for Llama / Qwen2 / Mistral checkpoints |
 | | `JsonParser` | Minimal zero-dependency JSON reader (`parse(text)`) |
 | Fine-tuning | `LoRALinear`, `LoRAAdapter` | Low-rank adapters on attention `wQ` / `wV` of all or selected blocks; freeze the base while attached |
@@ -622,18 +683,18 @@ Generated API documentation: see [API documentation](#api-documentation).
 
 These describe the current code, so you can plan around them:
 
-- **Precision and device:** `Float` (F32) only, on the CPU. Matrix multiplication is tiled, auto-vectorized by the JIT (or SIMD through the optional Vector API) and multi-threaded; attention, normalization and the element-wise ops are plain single-threaded loops.
+- **Precision and device:** `Float` (F32) only, on the CPU. Matrix multiplication is tiled, auto-vectorized by the JIT (or SIMD through the optional Vector API) and multi-threaded; cached attention is split across heads and tokens on the same threads; normalization and the element-wise ops are plain single-threaded loops.
 - **Shapes:** `matmul` and `transpose` take 2-D tensors. `+` broadcasts only a `[1, n]` row; `-` and `*` need identical shapes.
 - **Batching:** sequences in a batch must all have the same length (there is no padding mask), and attention memory grows with `(batch × sequenceLength)²`. Loss masking removes tokens from the loss only: attention still sees them, and examples packed into one sequence can attend to earlier examples.
-- **Generation:** greedy decoding only (no temperature or sampling). The KV cache is F32 and sized up front (`2 × layers × heads × maxSequenceLength × headDim` floats); `forward(indices, cache)` and `decode` record no gradient. `decode` itself allocates nothing; a multi-threaded matmul inside it creates a few fork/join task objects per call, and the `Sequence` returned by `generateStream` boxes each yielded id.
-- **Memory:** gradient arrays appear on first use, so training doubles the FP32 footprint of the weights being trained (frozen weights never get one); without the Vector API, the backward pass transposes weights in chunks of at most 4 MB.
+- **Generation:** greedy by default; `Sampling` adds temperature, top-k, top-p and a repetition penalty, and the penalty also covers the prompt tokens inside its window. The KV cache is F32 and sized up front (`2 × layers × heads × maxSequenceLength × headDim` floats); `prefill`, `forward(indices, cache)` and `decode` record no gradient. `decode` itself allocates nothing; a multi-threaded matmul inside it creates a few fork/join task objects per call, and the `Sequence` returned by `generateStream` boxes each yielded id.
+- **Memory:** gradient arrays appear on first use, so training doubles the FP32 footprint of the weights being trained (frozen weights never get one); without the Vector API, the backward pass transposes weights in chunks of at most 4 MB. Memory mapping covers quantized model files only: FP32 checkpoints and Hugging Face imports are read onto the heap, and so is the tokenizer (tens of MB for a 150,000-token vocabulary). On Windows, a mapped file can't be deleted or replaced while a model still maps it.
 - **Tokenizer:** byte-level BPE only; SentencePiece-style `tokenizer.json` files (`Metaspace`, `byte_fallback`) are not supported. Of the pre-tokenizers, `Split` and `ByteLevel` are applied and others (such as `Digits`) are skipped, and added tokens' `lstrip` / `rstrip` / `single_word` flags are ignored.
 - **Importer:** `model_type` llama / qwen2 / mistral only (Gemma's `1 + w` norms, Phi-3's fused QKV and Qwen3's q/k norms are rejected), `rope_scaling` only of type `llama3`, `head_dim` must equal `hidden_size / num_attention_heads`.
-- **Quantization:** weight-only (activations and the KV cache stay FP32), round-to-nearest with per-group min/max — no calibration or GPTQ/AWQ-style error correction; pre-quantized GGUF / AWQ files are not read. Norm weights and biases stay FP32.
+- **Quantization:** weight-only (activations and the KV cache stay FP32), round-to-nearest with per-group min/max — no calibration or GPTQ/AWQ-style error correction; pre-quantized GGUF / AWQ files are not read. Norm weights and biases stay FP32. A tied embedding uses the output head's quantization, which groups 64 dimensions of one token instead of 64 tokens of one dimension.
 - **LoRA scope:** adapters cover attention `wQ` and `wV` only, in all blocks or a chosen subset.
 - **Vector API:** the module is still incubating in the JDK, so it must be added with `--add-modules jdk.incubator.vector`; Android always runs the scalar kernels.
 - **SafeTensors:** writes F32 only; reads convert every dtype to F32.
-- **Android performance:** the kernels were tuned and measured on HotSpot (desktop and server JVMs). ART compiles the same code with a different optimizer, so throughput on phones has to be measured there; the sample app shows live tokens/s for that reason.
+- **Android performance:** the kernels were tuned on HotSpot and measured on one phone (see [Benchmarks](#benchmarks)). ART compiles the same code with a different optimizer, so other devices have to be measured; the sample app shows live tokens/s for that reason.
 
 ## Architecture
 
@@ -690,7 +751,11 @@ Kotensor/
             │   ├── HuggingFaceImportTest.kt
             │   ├── QuantizationTest.kt
             │   ├── BPETokenizerTest.kt
-            │   └── TrainingTest.kt
+            │   ├── TrainingTest.kt
+            │   ├── PrefillTest.kt
+            │   ├── MappedModelTest.kt
+            │   ├── PromptPrefixTest.kt
+            │   └── ParallelAttentionTest.kt
             └── resources/        # reference tokenizer.json files + encodings from Hugging Face `tokenizers`;
                                   # hf/: tiny Llama/Qwen-style checkpoints with NumPy reference logits
 ```
@@ -723,7 +788,7 @@ cd kotensor/Engine/kotensor
 ./gradlew test
 ```
 
-78 tests across twelve suites, run on the JUnit Platform with `kotlin-test`. `./gradlew test` runs them with the default scalar kernels and then again as `vectorApiTest`, with `--add-modules jdk.incubator.vector`, so both backends are checked:
+124 tests across eighteen suites, run on the JUnit Platform with `kotlin-test`. `./gradlew test` runs them with the default scalar kernels and then again as `vectorApiTest`, with `--add-modules jdk.incubator.vector`, so both backends are checked:
 
 | Suite | Tests |
 | :-- | :-- |
@@ -739,6 +804,12 @@ cd kotensor/Engine/kotensor
 | `QuantizationTest` (11) | Quantize/dequantize error bounds · dequantizing matmul vs dequantized FP32 (forward, accumulate, backward) · parallel vs serial · `matmulDequant` gradients · INT8/INT4 model within tolerance in full, cached, decode and batched paths · allocation-free quantized decode · QLoRA trains and decodes · quantized save/load round trip · quantized import equals quantize-after-import · bytes per weight · lazy gradients |
 | `BPETokenizerTest` (8) | Encodings and decodings identical to Hugging Face `tokenizers` on GPT-2-, Qwen- and Llama-3-style files · byte-level round trip of arbitrary text · special tokens · template tokens · in-code construction · incremental decoding · pre-tokenizer regex compilation (Android-safe flags) · JSON parser |
 | `TrainingTest` (12) | Masked cross-entropy equals the loss of the active rows · fused loss equals projection + cross-entropy (FP32 and INT4 heads, a 524,288-token vocabulary in chunks) · `Transformer.loss` equals the unfused loss with adapters attached · freezing leaves adapter gradients unchanged · backward skips frozen subgraphs and blocks below the lowest adapter · module flags and optimizers respect frozen tensors · `Aᵀ · B` / `A · Bᵀ` kernels vs naive · Vector API vs scalar kernels · `DataLoader` labels and prompt masking · per-batch telemetry and masked fine-tuning |
+| `PrefillTest` (14) | Buffered prefill equals the graph path (logits and cached keys/values) across chunk boundaries, on FP32, INT8 and INT4 models and with LoRA · prefill in two calls · decode after prefill · `generate` equals graph greedy decoding · argument checks · prefill allocates under 1 KB per extra prompt token · `noGrad` scopes, nesting and exceptions · frozen operands keep no parents · the cached forward keeps no graph · multi-row `LoRALinear.forwardInto` · `applyRowsInPlace` |
+| `MappedModelTest` (12) | Memory-mapped and heap-loaded models give identical logits in every path (INT8 and INT4) · scalar accessors agree · mapped decode allocates 0 bytes · saving a mapped model reproduces the file · reading the arrays moves a tensor to the heap · `SafeTensorsFile.map` · tied embeddings read the head's columns, count once, round-trip through files (heap and mapped) and require a quantized head · untied files still load · `dequantizeColumn` |
+| `PromptPrefixTest` (7) | Generation with a cached prefix equals generation without (full, partial, no and exact match; FP32 and INT4) · the prefix is reusable and unchanged · `matchLength` leaves the last token to prefill · `copyFrom` copies exact values and rejects mismatches · prefixes from another model are rejected · a multi-chunk prefix equals a full prefill |
+| `ParallelAttentionTest` (2) | Parallel attention (prefill, decode, cached forward) and generation equal the serial results exactly |
+| `SamplingTest` (7) | Greedy settings match default generation · a seed repeats a run · top-k keeps the best candidates · top-p drops the tail · the repetition penalty lowers recent tokens · invalid settings are rejected · `StreamingSession` accepts a `Sampling` |
+| `DecodeKernelTest` (4) | Unpack and lookup single-row kernels agree bit for bit on heap and mapped weights at one, three and four threads (INT4 with groups of 64 and 32, INT8) · accumulation with `alpha` · the thread count can change at runtime · the INT4 kernel defaults to lookup on Android |
 
 ## Android sample
 
@@ -765,7 +836,7 @@ The module is only included when the `kotensor.android` property is `true`, so t
 ```bash
 ./gradlew :benchmark:jmh                       # everything; JSON results in benchmark/build/results/jmh/results.json
 ./gradlew :benchmark:jmhJar
-java -jar benchmark/build/libs/benchmark-1.1.0-jmh.jar DecodeBenchmark -p weights=int4 -p sequenceLength=512
+java -jar benchmark/build/libs/benchmark-1.2.0-jmh.jar DecodeBenchmark -p weights=int4 -p sequenceLength=512
 ./gradlew :benchmark:jmh -Pkotensor.vectorApi=true    # the same suite on the Vector API backend
 ```
 
@@ -778,6 +849,20 @@ java -jar benchmark/build/libs/benchmark-1.1.0-jmh.jar DecodeBenchmark -p weight
 | `TokenizerBenchmark` | BPE encode and decode throughput on mixed-language text |
 
 Every run uses the `gc` profiler, so the results include `gc.alloc.rate.norm` — bytes allocated per operation — next to the throughput.
+
+### On a phone
+
+The JMH suite measures HotSpot. On a Xiaomi Redmi Note 11 Pro 4G (MediaTek Helio G96: two Cortex-A76 and six Cortex-A55 cores, Android 13), a Qwen2-0.5B fine-tune quantized to INT4 (366 MB, memory-mapped) generated 48 tokens greedily from a chat prompt with its 50-token system prompt cached, run twice from a command-line harness with `app_process`:
+
+| Engine | Kernel, threads | ms per decoded token |
+| :-- | :-- | --: |
+| Single-row kernel before the 1.2.0 rework | 8 | 2,107–2,139 |
+| 1.2.0 | unpack, 8 | 740–758 |
+| 1.2.0 | lookup, 8 (the Android default) | 533–604 |
+| 1.2.0 | unpack, 1 | 1,362–1,379 |
+| 1.2.0 | lookup, 1 | 744–746 |
+
+Every row produced the same tokens. Inside an app compiled ahead of time, the same model takes 0.43–0.58 s per token with the default kernel.
 
 ## API documentation
 
@@ -796,13 +881,13 @@ Publishing uses the [Central Portal](https://central.sonatype.com) through `com.
 1. Sign up for the Central Portal with the `TSPstudio` GitHub account; the portal then creates and verifies the `io.github.tspstudio` namespace automatically. An account created any other way adds the namespace under **Namespaces** and verifies it with a temporary public repository on that GitHub account, named after the verification key the portal shows. `group` and `coordinates` in `build.gradle.kts` must match the verified namespace exactly.
 2. Create a GPG key and upload its public half to a key server (for example `keyserver.ubuntu.com`).
 3. Add the repository secrets `MAVEN_CENTRAL_USERNAME` and `MAVEN_CENTRAL_PASSWORD` (a Central Portal user token), `SIGNING_KEY` (the ASCII-armored private key), `SIGNING_KEY_ID` and `SIGNING_KEY_PASSWORD`.
-4. Push a tag such as `v1.1.0`. `.github/workflows/release.yml` runs the tests, signs and uploads the publication, releases it, and attaches the JARs with a `SHA256SUMS` file to the GitHub release.
+4. Set `version` in `build.gradle.kts`, push that commit, and once CI passes push a tag such as `v1.2.0` pointing at it. `.github/workflows/release.yml` runs the tests, signs and uploads the publication, releases it, and attaches the JARs with a `SHA256SUMS` file to the GitHub release. The published version comes from `build.gradle.kts`, not from the tag, and a version on Maven Central can never be replaced.
 
 Signing is switched on only by `-PsignAllPublications=true` in that workflow, so local `publishToMavenLocal` builds need no keys.
 
 ## Roadmap
 
-The five planned layers are implemented, and so are all six milestones of [`Milestone.md`](Milestone.md): v0.2.0 KV-cached decoding and the BPE tokenizer; v0.3.0 tiled multi-threaded matmul and the zero-allocation decode loop; v0.4.0 grouped-query attention and the Hugging Face importer; v0.5.0 INT8 / INT4 quantization; v1.0.0 the Android sample, Dokka documentation, Maven Central publishing and the JMH suite; v1.1.0 loss masking, the fused output-layer loss, frozen-weight backpropagation and the Vector API kernels. [`CHANGELOG.md`](CHANGELOG.md) explains every change since v0.1.0 and why it was made.
+The five planned layers are implemented, and so are all seven milestones of [`Milestone.md`](Milestone.md): v0.2.0 KV-cached decoding and the BPE tokenizer; v0.3.0 tiled multi-threaded matmul and the zero-allocation decode loop; v0.4.0 grouped-query attention and the Hugging Face importer; v0.5.0 INT8 / INT4 quantization; v1.0.0 the Android sample, Dokka documentation, Maven Central publishing and the JMH suite; v1.1.0 loss masking, the fused output-layer loss, frozen-weight backpropagation and the Vector API kernels; v1.2.0 buffered prefill, `noGrad`, memory-mapped model files, tied embeddings, parallel attention and prompt prefix reuse. [`CHANGELOG.md`](CHANGELOG.md) explains every change since v0.1.0 and why it was made.
 
 <details>
 <summary><b>Layer 1 — Core Tensor & Autograd</b> ✅</summary>
@@ -904,6 +989,19 @@ The five planned layers are implemented, and so are all six milestones of [`Mile
 - [x] Matmul backward without transposed copies (`multiplyTransposedA` / `multiplyTransposedB`) — `MatMul.kt`
 - [x] Optional JVM Vector API (SIMD) kernels with a scalar fallback — `SimdKernels.kt`, `MatMul.kt`
 - [x] Per-batch training telemetry (`onBatchEnd`) — `FineTuningPipeline.kt`
+</details>
+
+<details>
+<summary><b>v1.2.0 — Low-Memory Inference</b> ✅</summary>
+
+- [x] Buffered prompt prefill in 32-token chunks with the output layer for the last token only; generation uses it — `Transformer.kt`, `TransformerBlock.kt`, `Attention.kt`, `RoPE.kt`, `InferenceBuffers.kt`, `LoRA.kt`
+- [x] `noGrad { }` and graph-free results for frozen operands; the cached forward records no graph — `Tensor.kt`, `Transformer.kt`
+- [x] Memory-mapped quantized model files (`loadQuantized(file, memoryMapped = true)`, `SafeTensorsFile.map`) with lazily allocated heap storage — `QuantizedTensor.kt`, `MatMul.kt`, `SafeTensors.kt`
+- [x] Embeddings tied to the quantized output head, saved once (`tieEmbeddingToHead`, `TiedQuantizedEmbedding`) — `Embedding.kt`, `QuantizedTensor.kt`, `Transformer.kt`
+- [x] Cached attention split across heads and tokens on the matmul pool — `Attention.kt`, `MatMul.kt`
+- [x] Single-row INT4 / INT8 kernel updating the accumulator once per four rows — `MatMul.kt`
+- [x] Prompt prefix reuse (`cachePrefix`, `PromptPrefix`, `KVCache.copyFrom`) — `KVCache.kt`, `Transformer.kt`
+- [x] Android 7 (API 24): no `ThreadLocal.withInitial` — `MatMul.kt`, `Tensor.kt`
 </details>
 
 ## License

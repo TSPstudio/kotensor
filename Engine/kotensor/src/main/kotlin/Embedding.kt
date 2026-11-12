@@ -112,3 +112,26 @@ class QuantizedEmbedding(
     }
 }
 
+class TiedQuantizedEmbedding(
+    val head: QuantizedLinear
+) : TokenEmbedding(head.outSize, head.inSize) {
+
+    override fun forward(indices: IntArray): Tensor {
+        val outData = FloatArray(indices.size * embeddingDim)
+        val weight = head.weight
+        for (t in indices.indices) {
+            val token = indices[t]
+            require(token in 0 until vocabularySize) { "$token out of vocab bounds $vocabularySize" }
+            weight.dequantizeColumn(token, outData, t * embeddingDim)
+        }
+        return Tensor(outData, intArrayOf(indices.size, embeddingDim)).also { it.requiresGrad = false }
+    }
+
+    override fun lookupInto(token: Int, out: Tensor): Tensor {
+        require(token in 0 until vocabularySize) { "$token out of vocab bounds $vocabularySize" }
+        require(out.data.size == embeddingDim) { "out has ${out.data.size} elements, embedding has $embeddingDim" }
+        head.weight.dequantizeColumn(token, out.data)
+        return out
+    }
+}
+

@@ -33,3 +33,21 @@ class InferenceBuffers(
         get() = (6L * dimension + 2L * kvDimension + 2L * hiddenDimension + vocabularySize + maxSequenceLength) * 4L
 }
 
+internal class PrefillBuffers(
+    val rows: Int,
+    dimension: Int,
+    hiddenDimension: Int,
+    kvDimension: Int
+) {
+    val x = Tensor(FloatArray(rows * dimension), intArrayOf(rows, dimension))
+    val normed = Tensor(FloatArray(rows * dimension), intArrayOf(rows, dimension))
+    val q = Tensor(FloatArray(rows * dimension), intArrayOf(rows, dimension))
+    val k = Tensor(FloatArray(rows * kvDimension), intArrayOf(rows, kvDimension))
+    val v = Tensor(FloatArray(rows * kvDimension), intArrayOf(rows, kvDimension))
+    val context = Tensor(FloatArray(rows * dimension), intArrayOf(rows, dimension))
+    val attentionOut = Tensor(FloatArray(rows * dimension), intArrayOf(rows, dimension))
+    val gate = Tensor(FloatArray(rows * hiddenDimension), intArrayOf(rows, hiddenDimension))
+    val up = Tensor(FloatArray(rows * hiddenDimension), intArrayOf(rows, hiddenDimension))
+    val ffnOut = Tensor(FloatArray(rows * dimension), intArrayOf(rows, dimension))
+}
+

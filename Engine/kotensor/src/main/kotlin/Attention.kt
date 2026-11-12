@@ -198,47 +198,7 @@ class Attention(
         }
 
         val contextData = FloatArray(tokens * dimension)
-        val attnWeights = FloatArray(startPosition + tokens)
-
-        for (h in 0 until numHeads) {
-            val headOffset = h * headDim
-            val kvHead = h / groupSize
-
-            for (t in 0 until tokens) {
-                val position = startPosition + t
-                val qOffset = t * dimension + headOffset
-                var maxScore = -1e9f
-
-                for (j in 0..position) {
-                    val kOffset = cache.offset(layer, kvHead, j)
-                    var dot = 0.0f
-                    for (d in 0 until headDim) {
-                        dot += qRoPE.data[qOffset + d] * cache.keys[kOffset + d]
-                    }
-                    val score = dot * scale
-                    attnWeights[j] = score
-                    if (score > maxScore) {
-                        maxScore = score
-                    }
-                }
-
-                var sumExp = 0.0f
-                for (j in 0..position) {
-                    val expVal = exp(attnWeights[j] - maxScore)
-                    attnWeights[j] = expVal
-                    sumExp += expVal
-                }
-                val invSumExp = 1.0f / sumExp
-
-                for (j in 0..position) {
-                    val w = attnWeights[j] * invSumExp
-                    val vOffset = cache.offset(layer, kvHead, j)
-                    for (d in 0 until headDim) {
-                        contextData[qOffset + d] += w * cache.values[vOffset + d]
-                    }
-                }
-            }
-        }
+        attendCached(qRoPE.data, tokens, startPosition, cache, layer, contextData, FloatArray(startPosition + tokens))
 
         val context = Tensor(contextData, intArrayOf(tokens, dimension))
         return wOut(context)
@@ -273,46 +233,119 @@ class Attention(
         }
 
         val context = buffers.context
-        val scores = buffers.scores
-        for (h in 0 until numHeads) {
+        attendCached(q.data, 1, position, cache, layer, context.data, buffers.scores)
+
+        return wOut.forwardInto(context, out)
+    }
+
+    internal fun prefillInto(input: Tensor, cache: KVCache, layer: Int, buffers: PrefillBuffers, scores: FloatArray): Tensor {
+        val tokens = buffers.rows
+        require(input.data.size == tokens * dimension) { "prefillInto takes $tokens tokens of $dimension elements, got ${input.data.size}" }
+        require(layer in 0 until cache.numLayers) { "Layer $layer out of cache bounds ${cache.numLayers}" }
+        require(cache.numHeads == numKeyValueHeads && cache.headDim == headDim) {
+            "Cache built for ${cache.numHeads} heads × ${cache.headDim} dims, attention has $numKeyValueHeads KV heads × $headDim"
+        }
+        val startPosition = cache.length
+        require(startPosition + tokens <= cache.maxSequenceLength) {
+            "KV cache full: $startPosition + $tokens positions exceed maxSequenceLength ${cache.maxSequenceLength}"
+        }
+        require(scores.size >= startPosition + tokens) { "Scores sized for ${scores.size} positions, prompt ends at ${startPosition + tokens}" }
+
+        val q = wQ.forwardInto(input, buffers.q)
+        val k = wK.forwardInto(input, buffers.k)
+        val v = wV.forwardInto(input, buffers.v)
+        rope.applyRowsInPlace(q, startPosition)
+        rope.applyRowsInPlace(k, startPosition)
+
+        for (h in 0 until numKeyValueHeads) {
             val headOffset = h * headDim
-            val kvHead = h / groupSize
-            var maxScore = -1e9f
-
-            for (j in 0..position) {
-                val kOffset = cache.offset(layer, kvHead, j)
-                var dot = 0.0f
+            for (t in 0 until tokens) {
+                val tokenOffset = t * kvDimension + headOffset
+                val cacheOffset = cache.offset(layer, h, startPosition + t)
                 for (d in 0 until headDim) {
-                    dot += q.data[headOffset + d] * cache.keys[kOffset + d]
-                }
-                val score = dot * scale
-                scores[j] = score
-                if (score > maxScore) {
-                    maxScore = score
-                }
-            }
-
-            var sumExp = 0.0f
-            for (j in 0..position) {
-                val expVal = exp(scores[j] - maxScore)
-                scores[j] = expVal
-                sumExp += expVal
-            }
-            val invSumExp = 1.0f / sumExp
-
-            for (d in 0 until headDim) {
-                context.data[headOffset + d] = 0.0f
-            }
-            for (j in 0..position) {
-                val w = scores[j] * invSumExp
-                val vOffset = cache.offset(layer, kvHead, j)
-                for (d in 0 until headDim) {
-                    context.data[headOffset + d] += w * cache.values[vOffset + d]
+                    cache.keys[cacheOffset + d] = k.data[tokenOffset + d]
+                    cache.values[cacheOffset + d] = v.data[tokenOffset + d]
                 }
             }
         }
 
-        return wOut.forwardInto(context, out)
+        attendCached(q.data, tokens, startPosition, cache, layer, buffers.context.data, scores)
+
+        return wOut.forwardInto(buffers.context, buffers.attentionOut)
+    }
+
+    private fun attendCached(q: FloatArray, tokens: Int, startPosition: Int, cache: KVCache, layer: Int, context: FloatArray, scores: FloatArray) {
+        val units = numHeads * tokens
+        val work = units.toLong() * (startPosition + tokens) * headDim * 2L
+        if (MatMul.runsInParallel(units, work)) {
+            MatMul.parallelFor(units, work) { unit ->
+                val token = unit % tokens
+                val position = startPosition + token
+                attendHead(q, unit / tokens, token, position, cache, layer, context, threadScores(position + 1))
+            }
+        } else {
+            for (h in 0 until numHeads) {
+                for (t in 0 until tokens) {
+                    attendHead(q, h, t, startPosition + t, cache, layer, context, scores)
+                }
+            }
+        }
+    }
+
+    private fun attendHead(q: FloatArray, head: Int, token: Int, position: Int, cache: KVCache, layer: Int, context: FloatArray, scores: FloatArray) {
+        val qOffset = token * dimension + head * headDim
+        val base = cache.offset(layer, head / groupSize, 0)
+        val keys = cache.keys
+        val values = cache.values
+        var maxScore = -1e9f
+
+        for (j in 0..position) {
+            val score = dot(q, qOffset, keys, base + j * headDim) * scale
+            scores[j] = score
+            if (score > maxScore) {
+                maxScore = score
+            }
+        }
+
+        var sumExp = 0.0f
+        for (j in 0..position) {
+            val expVal = exp(scores[j] - maxScore)
+            scores[j] = expVal
+            sumExp += expVal
+        }
+        val invSumExp = 1.0f / sumExp
+
+        for (d in 0 until headDim) {
+            context[qOffset + d] = 0.0f
+        }
+        for (j in 0..position) {
+            val w = scores[j] * invSumExp
+            val vOffset = base + j * headDim
+            for (d in 0 until headDim) {
+                context[qOffset + d] += w * values[vOffset + d]
+            }
+        }
+    }
+
+    private fun dot(a: FloatArray, aOffset: Int, b: FloatArray, bOffset: Int): Float {
+        var s0 = 0.0f
+        var s1 = 0.0f
+        var s2 = 0.0f
+        var s3 = 0.0f
+        var d = 0
+        while (d + 4 <= headDim) {
+            s0 += a[aOffset + d] * b[bOffset + d]
+            s1 += a[aOffset + d + 1] * b[bOffset + d + 1]
+            s2 += a[aOffset + d + 2] * b[bOffset + d + 2]
+            s3 += a[aOffset + d + 3] * b[bOffset + d + 3]
+            d += 4
+        }
+        var sum = (s0 + s1) + (s2 + s3)
+        while (d < headDim) {
+            sum += a[aOffset + d] * b[bOffset + d]
+            d++
+        }
+        return sum
     }
 
     override fun parameters(): List<Tensor> {
@@ -320,3 +353,12 @@ class Attention(
     }
 }
 
+private val attentionScratch = object : ThreadLocal<FloatArray>() {
+    override fun initialValue(): FloatArray = FloatArray(0)
+}
+
+private fun threadScores(size: Int): FloatArray {
+    val current = attentionScratch.get()
+    if (current.size >= size) return current
+    return FloatArray(maxOf(size, current.size * 2)).also { attentionScratch.set(it) }
+}

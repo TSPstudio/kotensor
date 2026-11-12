@@ -46,6 +46,15 @@ class TransformerBlock(
         return x.addInPlace(buffers.ffnOut)
     }
 
+    internal fun prefillInto(x: Tensor, cache: KVCache, layer: Int, buffers: PrefillBuffers, scores: FloatArray): Tensor {
+        norm1.forwardInto(x, buffers.normed)
+        attention.prefillInto(buffers.normed, cache, layer, buffers, scores)
+        x.addInPlace(buffers.attentionOut)
+        norm2.forwardInto(x, buffers.normed)
+        ffn.forwardInto(buffers.normed, buffers.ffnOut, buffers.gate, buffers.up)
+        return x.addInPlace(buffers.ffnOut)
+    }
+
     override fun parameters(): List<Tensor> {
         return norm1.parameters() + attention.parameters() + norm2.parameters() + ffn.parameters()
     }

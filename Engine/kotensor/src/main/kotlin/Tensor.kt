@@ -5,10 +5,14 @@ import kotlin.math.pow
 class Tensor (
     val data: FloatArray,
     val shape: IntArray,
-    val parents: List<Tensor> = emptyList(),
-    val backwardOp: () -> Unit = {}
+    parents: List<Tensor> = emptyList(),
+    backwardOp: () -> Unit = {}
 ){
-    var requiresGrad: Boolean = inheritsGrad(parents)
+    var requiresGrad: Boolean = parents.isEmpty() || (gradEnabled() && inheritsGrad(parents))
+
+    val parents: List<Tensor> = if (requiresGrad) parents else emptyList()
+
+    val backwardOp: () -> Unit = if (requiresGrad) backwardOp else NO_BACKWARD
 
     private var gradient: FloatArray? = null
 
@@ -370,6 +374,24 @@ class Tensor (
         return out
     }
 }
+
+fun <T> noGrad(block: () -> T): T {
+    val depth = gradDisabledDepth.get()
+    depth[0]++
+    try {
+        return block()
+    } finally {
+        depth[0]--
+    }
+}
+
+private val gradDisabledDepth: ThreadLocal<IntArray> = object : ThreadLocal<IntArray>() {
+    override fun initialValue(): IntArray = IntArray(1)
+}
+
+private val NO_BACKWARD: () -> Unit = {}
+
+private fun gradEnabled(): Boolean = gradDisabledDepth.get()[0] == 0
 
 private fun inheritsGrad(parents: List<Tensor>): Boolean {
     if (parents.isEmpty()) return true

@@ -136,6 +136,33 @@ class RoPE(
         return token
     }
 
+    fun applyRowsInPlace(rows: Tensor, startPosition: Int): Tensor {
+        require(rows.shape.size == 2 && rows.shape[1] % dimension == 0) { "Rows must be [tokens, heads × $dimension], got ${rows.shape.contentToString()}" }
+        val tokens = rows.shape[0]
+        val width = rows.shape[1]
+        val headsPerToken = width / dimension
+        val data = rows.data
+
+        for (t in 0 until tokens) {
+            val position = startPosition + t
+            val rowOffset = t * width
+            for (i in 0 until halfDim) {
+                val theta = position * invFreq[i]
+                val c = cos(theta)
+                val s = sin(theta)
+                for (h in 0 until headsPerToken) {
+                    val idx1 = rowOffset + h * dimension + i
+                    val idx2 = idx1 + halfDim
+                    val x1 = data[idx1]
+                    val x2 = data[idx2]
+                    data[idx1] = x1 * c - x2 * s
+                    data[idx2] = x1 * s + x2 * c
+                }
+            }
+        }
+        return rows
+    }
+
     override fun forward(input: Tensor): Tensor {
         return apply(input, 0)
     }

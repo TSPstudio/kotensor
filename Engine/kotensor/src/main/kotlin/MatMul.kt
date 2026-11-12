@@ -2,6 +2,7 @@ package io.kotensor.core
 
 import java.util.concurrent.ForkJoinPool
 import java.util.concurrent.RecursiveAction
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 
 internal interface VectorKernels {
@@ -18,12 +19,55 @@ object MatMul {
     private const val CHUNK_K = 1024
     private const val TRANSPOSE_CHUNK = 1 shl 20
 
-    val numThreads: Int = Runtime.getRuntime().availableProcessors()
+    private const val MAX_ROW_UNITS = 32
+    private const val TARGET_UNITS = 48
+    private const val UNIT_WORK = 1L shl 16
+    private const val COLUMN_SPLIT_COLUMNS = 8192
+    private const val MIN_BLOCK_BYTES = 128
+    private const val BLOCK_ALIGN = 64
+    private const val ROW_BATCH = 8
+
+    @Volatile
+    var numThreads: Int = defaultThreads()
+        set(value) {
+            require(value >= 1) { "numThreads must be at least 1, got $value" }
+            synchronized(this) {
+                if (value == field) return
+                field = value
+                currentPool?.shutdown()
+                currentPool = null
+            }
+        }
 
     @Volatile
     var parallelThreshold: Long = 1L shl 18
 
-    private val pool: ForkJoinPool by lazy { ForkJoinPool(numThreads) }
+    @Volatile
+    var lookupInt4: Boolean = defaultLookupInt4(System.getProperty("kotensor.int4Kernel"), System.getProperty("java.vm.name"))
+
+    @Volatile
+    private var currentPool: ForkJoinPool? = null
+
+    private val pool: ForkJoinPool
+        get() {
+            currentPool?.let { return it }
+            synchronized(this) {
+                return currentPool ?: ForkJoinPool(numThreads).also { currentPool = it }
+            }
+        }
+
+    private fun defaultThreads(): Int {
+        val available = Runtime.getRuntime().availableProcessors()
+        val configured = System.getProperty("kotensor.threads")?.trim()?.toIntOrNull() ?: return available
+        return configured.coerceIn(1, maxOf(1, available))
+    }
+
+    internal fun defaultLookupInt4(configured: String?, vmName: String?): Boolean {
+        val kernel = configured?.trim()
+        if (kernel.equals("lookup", ignoreCase = true)) return true
+        if (kernel.equals("unpack", ignoreCase = true)) return false
+        return vmName.orEmpty().contains("Dalvik", ignoreCase = true)
+    }
 
     private val vectorKernels: VectorKernels? = loadVectorKernels()
 
@@ -73,16 +117,16 @@ object MatMul {
         val bRow = FloatArray(TILE_N)
         val bytes = ByteArray(TILE_N)
         val nibbles = ByteArray(TILE_N)
-        val unpacked = FloatArray(TILE_N)
         val scaleRow = FloatArray(TILE_N)
         val zeroRow = FloatArray(TILE_N)
         val rowSums = FloatArray(TILE_M)
         val dots = FloatArray(4)
         val chunks = ArrayList<FloatArray>()
-        val accChunks = ArrayList<FloatArray>()
     }
 
-    private val scratch: ThreadLocal<Scratch> = ThreadLocal.withInitial { Scratch() }
+    private val scratch: ThreadLocal<Scratch> = object : ThreadLocal<Scratch>() {
+        override fun initialValue(): Scratch = Scratch()
+    }
 
     private class TileRange(val from: Int, val to: Int, val grain: Int, val body: (Int) -> Unit) : RecursiveAction() {
         override fun compute() {
@@ -112,6 +156,14 @@ object MatMul {
             val t1 = ((stripe + 1).toLong() * chunkCount / stripeCount).toInt()
             body(t0, t1)
         }
+    }
+
+    internal fun runsInParallel(count: Int, work: Long): Boolean {
+        return count > 1 && work >= parallelThreshold && numThreads > 1
+    }
+
+    internal fun parallelFor(count: Int, work: Long, body: (Int) -> Unit) {
+        forEachTile(count, work) { index -> body(index) }
     }
 
     fun multiply(
@@ -421,75 +473,377 @@ object MatMul {
         if (m == 0) return
 
         if (m == 1) {
-            forEachStripe(n, k.toLong() * n) { t0, t1 ->
-                computeQuantizedStripe(a, weight, c, accumulate, alpha, t0, t1)
-            }
+            multiplyQuantizedRow(a, weight, c, accumulate, alpha)
             return
         }
         val simd = simd()
-        val tilesN = (n + TILE_N - 1) / TILE_N
+        val width = quantizedTileWidth(n)
+        val tilesN = (n + width - 1) / width
         val tileCount = ((m + TILE_M - 1) / TILE_M) * tilesN
         forEachTile(tileCount, m.toLong() * k * n) { tile ->
-            computeQuantizedTile(a, weight, c, m, accumulate, alpha, tile, tilesN, simd)
+            computeQuantizedTile(a, weight, c, m, accumulate, alpha, tile, tilesN, width, simd)
         }
     }
 
-    private fun computeQuantizedStripe(a: FloatArray, weight: QuantizedTensor, c: FloatArray, accumulate: Boolean, alpha: Float, t0: Int, t1: Int) {
+    private fun quantizedTileWidth(n: Int): Int {
+        if (n >= TARGET_UNITS * TILE_N) return TILE_N
+        val wanted = (n + TARGET_UNITS - 1) / TARGET_UNITS
+        return ((wanted + BLOCK_ALIGN - 1) / BLOCK_ALIGN * BLOCK_ALIGN).coerceIn(BLOCK_ALIGN, TILE_N)
+    }
+
+    private fun multiplyQuantizedRow(a: FloatArray, weight: QuantizedTensor, c: FloatArray, accumulate: Boolean, alpha: Float) {
         val k = weight.rows
         val n = weight.columns
-        val s = scratch.get()
-        val zeros = weight.zeros
-        loadChunks(c, n, t0, t1, s.chunks, accumulate)
-        for (t in t0 until t1) chunkAt(s.accChunks, t - t0)
-
-        for (group in 0 until weight.groups) {
-            val k0 = group * weight.groupSize
-            val k1 = minOf(k0 + weight.groupSize, k)
-            for (t in t0 until t1) s.accChunks[t - t0].fill(0.0f, 0, minOf(TILE_N, n - t * TILE_N))
-            var rowSum = 0.0f
-            for (l in k0 until k1) {
-                val al = a[l]
-                rowSum += al
-                for (t in t0 until t1) {
-                    val j0 = t * TILE_N
-                    val len = minOf(TILE_N, n - j0)
-                    unpackRow(weight, l, j0, len, s)
-                    axpy(s.accChunks[t - t0], s.bRow, al, len, null)
-                }
+        val rowBytes = weight.bytesPerRow
+        val targetUnits = (k.toLong() * n / UNIT_WORK).toInt().coerceIn(1, TARGET_UNITS)
+        val rowsPerUnit: Int
+        val wantedColumnUnits: Int
+        if (n >= COLUMN_SPLIT_COLUMNS) {
+            rowsPerUnit = k
+            wantedColumnUnits = targetUnits
+        } else {
+            val groupsPerUnit = (weight.groups + MAX_ROW_UNITS - 1) / MAX_ROW_UNITS
+            rowsPerUnit = minOf(k, groupsPerUnit * weight.groupSize)
+            wantedColumnUnits = (targetUnits * rowsPerUnit + k - 1) / k
+        }
+        val rowUnits = (k + rowsPerUnit - 1) / rowsPerUnit
+        val columnUnits = wantedColumnUnits.coerceIn(1, maxOf(1, rowBytes / MIN_BLOCK_BYTES))
+        val blockBytes = minOf(rowBytes, ((rowBytes + columnUnits - 1) / columnUnits + BLOCK_ALIGN - 1) / BLOCK_ALIGN * BLOCK_ALIGN)
+        val blocks = (rowBytes + blockBytes - 1) / blockBytes
+        val partials = if (rowUnits > 1) rowScratch.get().partialBuffer(rowUnits * n) else null
+        partials?.fill(0.0f, 0, rowUnits * n)
+        if (!accumulate) c.fill(0.0f, 0, n)
+        runUnits(rowUnits * blocks, k.toLong() * n) { unit ->
+            val rowUnit = unit / blocks
+            val r0 = rowUnit * rowsPerUnit
+            val r1 = minOf(r0 + rowsPerUnit, k)
+            val b0 = (unit % blocks) * blockBytes
+            val b1 = minOf(b0 + blockBytes, rowBytes)
+            if (partials == null) {
+                rowUnitInto(a, weight, c, 0, r0, r1, b0, b1, alpha)
+            } else {
+                rowUnitInto(a, weight, partials, rowUnit * n, r0, r1, b0, b1, alpha)
             }
-            for (t in t0 until t1) {
-                val j0 = t * TILE_N
-                val len = minOf(TILE_N, n - j0)
-                val groupOffset = group * n + j0
-                System.arraycopy(weight.scales, groupOffset, s.scaleRow, 0, len)
-                if (zeros != null) {
-                    System.arraycopy(zeros, groupOffset, s.bytes, 0, len)
-                    bytesToFloats(s.bytes, s.zeroRow, len)
-                    combineWithZeroPoint(s.chunks[t - t0], s.accChunks[t - t0], s.scaleRow, s.zeroRow, alpha, rowSum, len)
-                } else {
-                    combine(s.chunks[t - t0], s.accChunks[t - t0], s.scaleRow, alpha, len)
+        }
+        if (partials != null) {
+            for (u in 0 until rowUnits) {
+                val offset = u * n
+                for (j in 0 until n) {
+                    c[j] += partials[offset + j]
                 }
             }
         }
-        storeChunks(c, n, t0, t1, s.chunks)
+    }
+
+    private class RowScratch {
+        var bytes = ByteArray(0)
+        var low = Array(0) { FloatArray(TILE_N) }
+        var high = Array(0) { FloatArray(TILE_N) }
+        var scales = FloatArray(0)
+        var zeros = ByteArray(0)
+        val unpacked = Array(8) { FloatArray(TILE_N) }
+        val nibbles = ByteArray(TILE_N)
+        val chunk = ByteArray(TILE_N)
+        val table = FloatArray(64)
+        private var partials = FloatArray(0)
+
+        fun ensure(width: Int, batchBytes: Int) {
+            val chunks = (width + TILE_N - 1) / TILE_N
+            if (low.size < chunks) {
+                low = Array(chunks) { FloatArray(TILE_N) }
+                high = Array(chunks) { FloatArray(TILE_N) }
+            }
+            if (scales.size < width) {
+                scales = FloatArray(width)
+                zeros = ByteArray(width)
+            }
+            if (bytes.size < batchBytes) bytes = ByteArray(batchBytes)
+        }
+
+        fun partialBuffer(size: Int): FloatArray {
+            if (partials.size < size) partials = FloatArray(size)
+            return partials
+        }
+    }
+
+    private val rowScratch: ThreadLocal<RowScratch> = object : ThreadLocal<RowScratch>() {
+        override fun initialValue(): RowScratch = RowScratch()
+    }
+
+    private class UnitWorker(val units: Int, val next: AtomicInteger, val body: (Int) -> Unit) : RecursiveAction() {
+        override fun compute() {
+            while (true) {
+                val unit = next.getAndIncrement()
+                if (unit >= units) return
+                body(unit)
+            }
+        }
+    }
+
+    private class UnitWorkers(val workers: Int, val units: Int, val body: (Int) -> Unit) : RecursiveAction() {
+        override fun compute() {
+            val next = AtomicInteger()
+            invokeAll(List(workers) { UnitWorker(units, next, body) })
+        }
+    }
+
+    private inline fun runUnits(units: Int, work: Long, crossinline body: (Int) -> Unit) {
+        val threads = numThreads
+        if (units == 1 || work < parallelThreshold || threads == 1) {
+            for (unit in 0 until units) body(unit)
+        } else {
+            pool.invoke(UnitWorkers(minOf(threads, units), units) { unit -> body(unit) })
+        }
+    }
+
+    private fun rowUnitInto(a: FloatArray, weight: QuantizedTensor, out: FloatArray, outOffset: Int, r0: Int, r1: Int, b0: Int, b1: Int, alpha: Float) {
+        val n = weight.columns
+        val rowBytes = weight.bytesPerRow
+        val groupSize = weight.groupSize
+        val width = b1 - b0
+        val chunks = (width + TILE_N - 1) / TILE_N
+        val packed = weight.bits == 4
+        val lookup = packed && lookupInt4
+        val highColumns = if (packed) minOf(rowBytes + b1, n) - (rowBytes + b0) else 0
+        val fullRows = width == rowBytes
+        val views = weight.mappedViews()
+        val heap = if (views == null) weight.qdata else null
+        val s = rowScratch.get()
+        s.ensure(width, ROW_BATCH * width)
+        val low = s.low
+        val high = s.high
+        var row = r0
+        while (row < r1) {
+            val group = row / groupSize
+            val groupEnd = minOf(r1, (group + 1) * groupSize)
+            for (chunk in 0 until chunks) {
+                low[chunk].fill(0.0f)
+                if (packed) high[chunk].fill(0.0f)
+            }
+            var rowSum = 0.0f
+            var l = row
+            while (l < groupEnd) {
+                val batch = minOf(ROW_BATCH, groupEnd - l)
+                val q: ByteArray
+                val base: Int
+                val stride: Int
+                if (heap != null) {
+                    q = heap
+                    base = l * rowBytes + b0
+                    stride = rowBytes
+                } else if (fullRows) {
+                    views!!.readQData(l * rowBytes, s.bytes, 0, batch * rowBytes)
+                    q = s.bytes
+                    base = 0
+                    stride = rowBytes
+                } else {
+                    for (i in 0 until batch) views!!.readQData((l + i) * rowBytes + b0, s.bytes, i * width, width)
+                    q = s.bytes
+                    base = 0
+                    stride = width
+                }
+                var i = 0
+                while (i + 4 <= batch) {
+                    val a0 = a[l + i]
+                    val a1 = a[l + i + 1]
+                    val a2 = a[l + i + 2]
+                    val a3 = a[l + i + 3]
+                    rowSum += a0
+                    rowSum += a1
+                    rowSum += a2
+                    rowSum += a3
+                    val offset = base + i * stride
+                    if (lookup) {
+                        lookup4(q, offset, stride, width, a0, a1, a2, a3, s)
+                    } else {
+                        unpack4(q, offset, stride, width, packed, a0, a1, a2, a3, s)
+                    }
+                    i += 4
+                }
+                while (i < batch) {
+                    val al = a[l + i]
+                    rowSum += al
+                    val offset = base + i * stride
+                    if (lookup) {
+                        lookup1(q, offset, width, al, s)
+                    } else {
+                        unpack1(q, offset, width, packed, al, s)
+                    }
+                    i++
+                }
+                l += batch
+            }
+            combineGroup(weight, views, group * n + b0, width, rowSum, alpha, low, out, outOffset + b0, s)
+            if (highColumns > 0) {
+                combineGroup(weight, views, group * n + rowBytes + b0, highColumns, rowSum, alpha, high, out, outOffset + rowBytes + b0, s)
+            }
+            row = groupEnd
+        }
+    }
+
+    private fun lookup4(q: ByteArray, offset: Int, stride: Int, width: Int, a0: Float, a1: Float, a2: Float, a3: Float, s: RowScratch) {
+        val table = s.table
+        for (v in 0 until 16) {
+            val f = v.toFloat()
+            table[v] = a0 * f
+            table[16 + v] = a1 * f
+            table[32 + v] = a2 * f
+            table[48 + v] = a3 * f
+        }
+        var c0 = 0
+        var chunk = 0
+        while (c0 < width) {
+            val len = minOf(TILE_N, width - c0)
+            val low = s.low[chunk]
+            val high = s.high[chunk]
+            val o0 = offset + c0
+            val o1 = o0 + stride
+            val o2 = o1 + stride
+            val o3 = o2 + stride
+            for (c in 0 until len) {
+                val q0 = q[o0 + c].toInt()
+                val q1 = q[o1 + c].toInt()
+                val q2 = q[o2 + c].toInt()
+                val q3 = q[o3 + c].toInt()
+                var lo = low[c]
+                lo += table[q0 and 15]
+                lo += table[16 + (q1 and 15)]
+                lo += table[32 + (q2 and 15)]
+                lo += table[48 + (q3 and 15)]
+                low[c] = lo
+                var hi = high[c]
+                hi += table[(q0 shr 4) and 15]
+                hi += table[16 + ((q1 shr 4) and 15)]
+                hi += table[32 + ((q2 shr 4) and 15)]
+                hi += table[48 + ((q3 shr 4) and 15)]
+                high[c] = hi
+            }
+            c0 += len
+            chunk++
+        }
+    }
+
+    private fun lookup1(q: ByteArray, offset: Int, width: Int, a0: Float, s: RowScratch) {
+        val table = s.table
+        for (v in 0 until 16) {
+            table[v] = a0 * v.toFloat()
+        }
+        var c0 = 0
+        var chunk = 0
+        while (c0 < width) {
+            val len = minOf(TILE_N, width - c0)
+            val low = s.low[chunk]
+            val high = s.high[chunk]
+            val o = offset + c0
+            for (c in 0 until len) {
+                val q0 = q[o + c].toInt()
+                low[c] += table[q0 and 15]
+                high[c] += table[(q0 shr 4) and 15]
+            }
+            c0 += len
+            chunk++
+        }
+    }
+
+    private fun unpack4(q: ByteArray, offset: Int, stride: Int, width: Int, packed: Boolean, a0: Float, a1: Float, a2: Float, a3: Float, s: RowScratch) {
+        val x = s.unpacked
+        val nib = s.nibbles
+        val bytes = s.chunk
+        var c0 = 0
+        var chunk = 0
+        while (c0 < width) {
+            val len = minOf(TILE_N, width - c0)
+            for (r in 0 until 4) {
+                System.arraycopy(q, offset + r * stride + c0, bytes, 0, len)
+                if (packed) {
+                    lowNibbles(bytes, nib, len)
+                    bytesToFloats(nib, x[r], 0, len)
+                } else {
+                    bytesToFloats(bytes, x[r], 0, len)
+                }
+            }
+            accumulate4(s.low[chunk], x[0], x[1], x[2], x[3], a0, a1, a2, a3, len)
+            if (packed) {
+                for (r in 0 until 4) {
+                    System.arraycopy(q, offset + r * stride + c0, bytes, 0, len)
+                    highNibbles(bytes, nib, len)
+                    bytesToFloats(nib, x[r], 0, len)
+                }
+                accumulate4(s.high[chunk], x[0], x[1], x[2], x[3], a0, a1, a2, a3, len)
+            }
+            c0 += len
+            chunk++
+        }
+    }
+
+    private fun unpack1(q: ByteArray, offset: Int, width: Int, packed: Boolean, a0: Float, s: RowScratch) {
+        val x = s.unpacked[0]
+        val nib = s.nibbles
+        val bytes = s.chunk
+        var c0 = 0
+        var chunk = 0
+        while (c0 < width) {
+            val len = minOf(TILE_N, width - c0)
+            System.arraycopy(q, offset + c0, bytes, 0, len)
+            if (packed) {
+                lowNibbles(bytes, nib, len)
+                bytesToFloats(nib, x, 0, len)
+                axpy(s.low[chunk], x, a0, len, null)
+                highNibbles(bytes, nib, len)
+                bytesToFloats(nib, x, 0, len)
+                axpy(s.high[chunk], x, a0, len, null)
+            } else {
+                bytesToFloats(bytes, x, 0, len)
+                axpy(s.low[chunk], x, a0, len, null)
+            }
+            c0 += len
+            chunk++
+        }
+    }
+
+    private fun combineGroup(weight: QuantizedTensor, views: MappedViews?, scaleOffset: Int, count: Int, rowSum: Float, alpha: Float, acc: Array<FloatArray>, out: FloatArray, outStart: Int, s: RowScratch) {
+        val scales = s.scales
+        weight.readScales(views, scaleOffset, scales, 0, count)
+        val zeros = s.zeros
+        val hasZeros = weight.hasZeroPoints
+        if (hasZeros) weight.readZeros(views, scaleOffset, zeros, 0, count)
+        var c0 = 0
+        var chunk = 0
+        while (c0 < count) {
+            val len = minOf(TILE_N, count - c0)
+            val values = acc[chunk]
+            val o = outStart + c0
+            if (hasZeros) {
+                for (c in 0 until len) {
+                    out[o + c] += alpha * scales[c0 + c] * (values[c] - zeros[c0 + c].toFloat() * rowSum)
+                }
+            } else {
+                for (c in 0 until len) {
+                    out[o + c] += alpha * scales[c0 + c] * values[c]
+                }
+            }
+            c0 += len
+            chunk++
+        }
     }
 
     private fun computeQuantizedTile(
         a: FloatArray, weight: QuantizedTensor, c: FloatArray,
         m: Int, accumulate: Boolean, alpha: Float,
-        tile: Int, tilesN: Int, simd: VectorKernels?
+        tile: Int, tilesN: Int, width: Int, simd: VectorKernels?
     ) {
         val k = weight.rows
         val n = weight.columns
         val i0 = (tile / tilesN) * TILE_M
-        val j0 = (tile % tilesN) * TILE_N
+        val j0 = (tile % tilesN) * width
         val rows = minOf(TILE_M, m - i0)
-        val len = minOf(TILE_N, n - j0)
+        val len = minOf(width, n - j0)
         val s = scratch.get()
         val ct = s.rows
         val acc = s.groupRows
         val rowSums = s.rowSums
-        val zeros = weight.zeros
+        val views = weight.mappedViews()
+        val hasZeros = weight.hasZeroPoints
 
         loadTile(c, n, i0, j0, rows, len, ct, accumulate)
 
@@ -501,7 +855,7 @@ object MatMul {
                 rowSums[r] = 0.0f
             }
             for (l in k0 until k1) {
-                unpackRow(weight, l, j0, len, s)
+                unpackRow(weight, views, l, j0, len, s, s.bRow)
                 val aColumn = i0 * k + l
                 accumulateRows(a, aColumn, k, rows, s.bRow, acc, 1.0f, len, simd)
                 for (r in 0 until rows) {
@@ -509,9 +863,9 @@ object MatMul {
                 }
             }
             val groupOffset = group * n + j0
-            System.arraycopy(weight.scales, groupOffset, s.scaleRow, 0, len)
-            if (zeros != null) {
-                System.arraycopy(zeros, groupOffset, s.bytes, 0, len)
+            weight.readScales(views, groupOffset, s.scaleRow, 0, len)
+            if (hasZeros) {
+                weight.readZeros(views, groupOffset, s.bytes, 0, len)
                 bytesToFloats(s.bytes, s.zeroRow, len)
                 for (r in 0 until rows) {
                     combineWithZeroPoint(ct[r], acc[r], s.scaleRow, s.zeroRow, alpha, rowSums[r], len)
@@ -526,34 +880,50 @@ object MatMul {
         storeTile(c, n, i0, j0, rows, len, ct)
     }
 
-    private fun unpackRow(weight: QuantizedTensor, row: Int, j0: Int, len: Int, s: Scratch) {
+    private fun unpackRow(weight: QuantizedTensor, views: MappedViews?, row: Int, j0: Int, len: Int, s: Scratch, out: FloatArray) {
         val bytesPerRow = weight.bytesPerRow
         if (weight.bits == 8) {
-            System.arraycopy(weight.qdata, row * bytesPerRow + j0, s.bytes, 0, len)
-            bytesToFloats(s.bytes, s.bRow, len)
+            weight.readQData(views, row * bytesPerRow + j0, s.bytes, 0, len)
+            bytesToFloats(s.bytes, out, 0, len)
             return
         }
         val half = bytesPerRow
         val j1 = j0 + len
         if (j0 < half) {
             val count = minOf(j1, half) - j0
-            System.arraycopy(weight.qdata, row * half + j0, s.bytes, 0, count)
+            weight.readQData(views, row * half + j0, s.bytes, 0, count)
             lowNibbles(s.bytes, s.nibbles, count)
-            bytesToFloats(s.nibbles, s.bRow, count)
+            bytesToFloats(s.nibbles, out, 0, count)
         }
         if (j1 > half) {
             val start = maxOf(j0, half)
             val count = j1 - start
-            System.arraycopy(weight.qdata, row * half + (start - half), s.bytes, 0, count)
+            weight.readQData(views, row * half + (start - half), s.bytes, 0, count)
             highNibbles(s.bytes, s.nibbles, count)
-            bytesToFloats(s.nibbles, s.unpacked, count)
-            System.arraycopy(s.unpacked, 0, s.bRow, start - j0, count)
+            bytesToFloats(s.nibbles, out, start - j0, count)
+        }
+    }
+
+    private fun accumulate4(acc: FloatArray, x0: FloatArray, x1: FloatArray, x2: FloatArray, x3: FloatArray, a0: Float, a1: Float, a2: Float, a3: Float, len: Int) {
+        for (j in 0 until len) {
+            var v = acc[j]
+            v += a0 * x0[j]
+            v += a1 * x1[j]
+            v += a2 * x2[j]
+            v += a3 * x3[j]
+            acc[j] = v
         }
     }
 
     private fun bytesToFloats(bytes: ByteArray, floats: FloatArray, len: Int) {
         for (j in 0 until len) {
             floats[j] = bytes[j].toFloat()
+        }
+    }
+
+    private fun bytesToFloats(bytes: ByteArray, floats: FloatArray, offset: Int, len: Int) {
+        for (j in 0 until len) {
+            floats[offset + j] = bytes[j].toFloat()
         }
     }
 

@@ -22,7 +22,7 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
                              ▼                                 ▼
                       v0.4.0 (Done)                   v0.5.0 (Done)
                              │                                 │
-                             └────────────────► v1.0.0 (Done) ──────► v1.1.0 (Current)
+                             └────────────────► v1.0.0 (Done) ──────► v1.1.0 (Done) ──────► v1.2.0 (Current)
 ```
 
 ---
@@ -203,6 +203,56 @@ v0.1.0 (Done) ──────► v0.2.0 (Done) ──────────
 | Output-layer floating-point operations per step | 52 billion (forward, input gradient, weight gradient) | ~4.8 billion | 9.8 billion (forward and input gradient for 18 tokens; no weight gradient) |
 | Output-layer time per step | — | — | 2.7 s → 0.70 s (0.33 s with the Vector API) |
 | Step time, full Qwen2-0.5B shape | ~15–18 s | ~2.5–3.5 s | 3.0 s with the Vector API, 4.6 s without; v1.0.0 ran out of a 6 GB heap |
+
+---
+
+### Milestone 7 (v1.2.0): Low-Memory Inference ✅
+
+**Goal:** Run a Qwen2-0.5B-class INT4 model inside an Android app's Java heap limit — 256 to 512 MB even with `android:largeHeap` — whatever the length of the prompt.
+
+**Status: complete.** Delivered in `Transformer.kt`, `TransformerBlock.kt`, `Attention.kt`, `RoPE.kt`, `InferenceBuffers.kt`, `KVCache.kt`, `Tensor.kt`, `QuantizedTensor.kt`, `MatMul.kt`, `SafeTensors.kt`, `Embedding.kt` and `LoRA.kt`; verified by `PrefillTest` (14 tests), `MappedModelTest` (12), `PromptPrefixTest` (7) and `ParallelAttentionTest` (2), and the whole suite — now 113 tests — passes on the scalar kernels and on the Vector API. [`CHANGELOG.md`](Engine/kotensor/CHANGELOG.md) describes every change.
+- **Buffered prefill:** `Transformer.prefill(prompt, cache, buffers)` runs the prompt 32 tokens at a time through reusable buffers, appends the keys and values to the cache and computes the output layer for the last token only; `generate`, `generateStream` and `StreamingSession` use it. Logits and cache contents equal the graph path.
+- **No graph without gradients:** `noGrad { }` stops graph recording on the current thread, results whose inputs are all frozen no longer keep them, and the cached forward records nothing.
+- **Memory-mapped model files:** `loadQuantized(file, memoryMapped = true)` maps the packed weights, scales and zero points from the file, so only norm weights and biases are on the heap; output is identical to heap loading and decoding still allocates nothing.
+- **Tied embeddings:** `tieEmbeddingToHead()` makes the token embedding read the quantized output head, and `saveQuantized` stores the shared matrix once (`kotensor.tiedEmbedding` in the metadata).
+- **Parallel attention:** cached attention is split across heads and query tokens on the matmul pool, with the same threshold, so short decode steps stay serial and allocation-free.
+- **Reworked single-row kernel:** the INT4 / INT8 decode kernel is split into shape-based work units that threads take from a shared counter, with bit-identical unpack and lookup inner loops; lookup is the INT4 default on Android. On a Helio G96 phone a decoded token went from 2.1 s to 0.53–0.60 s with identical output.
+- **Threads and sampling:** `MatMul.numThreads` can change at runtime, and `Sampling` adds temperature, top-k, top-p and a repetition penalty to generation.
+- **Prompt prefix reuse:** `cachePrefix(tokens)` keeps a system prompt's keys and values, and `generate` / `generateStream` with a prefix copy the matching positions instead of recomputing them.
+- **Android 7:** no `ThreadLocal.withInitial`, so the library runs on API 24.
+- **Measured** with an INT4 Qwen2-0.5B fine-tune (366 MB file) that ran out of memory in an Android app: 1.1.0 also runs out of a 512 MB JVM heap on a 75-token prompt; 1.2.0 answers in 512 MB with heap loading and in 128 MB memory-mapped, holding 3 MB of weights on the heap, with the same tokens, the first token 2.0–2.3× sooner and each further token about 20% sooner; a Lecly first message starts answering in 0.54 s with its system prompt reused.
+
+#### 1. Bottlenecks identified
+| Area | Problem in v1.1.0 |
+| :-- | :-- |
+| Prompt prefill | `generate` ran the prompt through the graph path, so every activation of every layer stayed reachable until the first decode step — about 3.8 MB per prompt token for Qwen2-0.5B — plus two `[tokens × 151,936]` logits arrays of which only the last row was used |
+| Graph retention | An operation's result kept its inputs even when nothing required a gradient, so inference through `forward` held the whole graph |
+| Weights on the heap | `loadQuantized` read 349 MiB of weights into Java arrays, leaving less than 160 MB of a 512 MB heap for the app |
+| Duplicate vocabulary matrix | Tied embeddings were imported as two copies and saved twice, 75 MiB each |
+| Single-threaded attention | Cached attention ran on one core and grows with the square of the context |
+| Repeated system prompt | Every message recomputed the same opening tokens |
+| Android 7 | `ThreadLocal.withInitial` requires API 26 |
+
+#### 2. Technical specification
+* **Buffered prefill (priority: critical):** process the prompt in chunks of `MatMul.TILE_M` rows with `forwardInto` and in-place operations, attend over the cache per chunk, and project only the last row to the vocabulary; memory independent of the prompt length.
+* **`noGrad` (priority: high):** a thread-local scope in which tensors keep neither parents nor backward closures; leaves still default to `requiresGrad = true`.
+* **Memory-mapped storage (priority: high):** `FileChannel.map` per tensor; kernels read through per-thread duplicates with bulk relative `get`, using only `Buffer` methods that exist on every Android version; heap arrays allocated lazily and only when the public arrays are read.
+* **Tied embeddings (priority: medium):** the embedding reads column *t* of the quantized head; saved files carry a metadata flag and no embedding tensors; untied files load unchanged.
+* **Parallel attention (priority: high):** distribute (head, query token) pairs over the matmul pool above `parallelThreshold`.
+* **Faster single-row kernel (priority: medium):** one accumulator pass per four unpacked rows, keeping the summation order.
+* **Prompt prefix reuse (priority: high):** cache a prefix's keys and values once, match it against each prompt by tokens and prefill only the rest.
+* **Android 7 (priority: high):** remove API 26 calls.
+
+| Metric | v1.1.0 | Measured in v1.2.0 (2-core container) |
+| :-- | :-- | :-- |
+| Extra memory to prefill a prompt (Qwen2-0.5B) | ~5 MB per token, until the first generated token | ~2 MB in total |
+| Heap held by INT4 Qwen2-0.5B weights | 350 MB | 3 MB, memory-mapped |
+| INT4 Qwen2-0.5B file | 366 MB | 288 MB, tied |
+| Heap needed to answer a 75-token prompt | more than 512 MB | less than 128 MB, memory-mapped |
+| First token, 75 / 367-token prompt | 5.2 s / 24.0 s | 2.6 s / 10.3 s on the heap, 2.9 s / 11.3 s mapped |
+| First token, 1,600-token prompt | 81.2 s | 60.1 s |
+| Each decoded token | 0.19 s | 0.15 s |
+| First token of a Lecly first message | 1.96 s | 0.54 s with the system prompt reused |
 
 ---
 

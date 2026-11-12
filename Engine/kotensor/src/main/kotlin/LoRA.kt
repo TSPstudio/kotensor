@@ -37,10 +37,12 @@ class LoRALinear(
     private val lowRank = Tensor(FloatArray(rank), intArrayOf(1, rank))
 
     override fun forwardInto(input: Tensor, out: Tensor): Tensor {
-        require(input.shape.size == 2 && input.shape[0] == 1) { "forwardInto takes a single token row, got ${input.shape.contentToString()}" }
+        require(input.shape.size == 2) { "forwardInto takes [tokens, features] rows, got ${input.shape.contentToString()}" }
+        val tokens = input.shape[0]
+        val projected = if (tokens == 1) lowRank else Tensor(FloatArray(tokens * rank), intArrayOf(tokens, rank))
         baseLinear.forwardInto(input, out)
-        input.matmulInto(loraA, lowRank)
-        return lowRank.matmulInto(loraB, out, accumulate = true, scale = scaling)
+        input.matmulInto(loraA, projected)
+        return projected.matmulInto(loraB, out, accumulate = true, scale = scaling)
     }
 
     override fun parameters(): List<Tensor> {

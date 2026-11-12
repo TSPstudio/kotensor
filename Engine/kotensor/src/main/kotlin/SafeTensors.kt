@@ -4,8 +4,10 @@ import java.io.Closeable
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.nio.Buffer
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 
 class SafeTensorsFile(val file: File) : Closeable {
 
@@ -98,6 +100,14 @@ class SafeTensorsFile(val file: File) : Closeable {
         return bytes
     }
 
+    fun map(name: String): ByteBuffer {
+        val entry = entry(name)
+        val buffer: ByteBuffer = synchronized(input) {
+            input.channel.map(FileChannel.MapMode.READ_ONLY, dataStart + entry.byteOffset, entry.byteLength)
+        }
+        return buffer.order(ByteOrder.LITTLE_ENDIAN)
+    }
+
     private fun readInto(entry: Entry, dest: FloatArray, destOffset: Int) {
         val count = entry.elementCount
         require(destOffset >= 0 && destOffset + count <= dest.size) { "Destination too small for ${entry.name}: needs $count elements at $destOffset, has ${dest.size}" }
@@ -111,8 +121,8 @@ class SafeTensorsFile(val file: File) : Closeable {
         var remaining = count
         while (remaining > 0) {
             val elements = minOf(remaining, chunkElements)
-            chunk.clear()
-            chunk.limit(elements * bytesPerElement)
+            (chunk as Buffer).clear()
+            (chunk as Buffer).limit(elements * bytesPerElement)
             synchronized(input) {
                 input.seek(position)
                 input.readFully(chunk.array(), 0, elements * bytesPerElement)

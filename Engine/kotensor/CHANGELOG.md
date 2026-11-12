@@ -1,6 +1,6 @@
-# Kotensor changelog — from v0.1.0 to v1.1.0
+# Kotensor changelog — from v0.1.0 to v1.2.0
 
-This document explains everything that changed in Kotensor between the original engine (v0.1.0, "milestone 0") and v1.1.0, following the six milestones of [`Milestone.md`](Milestone.md). For every modification it answers four questions:
+This document explains everything that changed in Kotensor between the original engine (v0.1.0, "milestone 0") and v1.2.0, following the seven milestones of [`Milestone.md`](Milestone.md). For every modification it answers four questions:
 
 - **What changed** — the files and the new or changed behavior.
 - **Why it was needed** — the problem it solves, measured where possible.
@@ -18,6 +18,7 @@ This document explains everything that changed in Kotensor between the original 
 - [v0.5.0 — Edge quantization (INT8 / INT4)](#v050--edge-quantization-int8--int4)
 - [v1.0.0 — Production hardening and ecosystem integration](#v100--production-hardening-and-ecosystem-integration)
 - [v1.1.0 — Training engine efficiency](#v110--training-engine-efficiency)
+- [v1.2.0 — Low-memory inference](#v120--low-memory-inference)
 - [Cross-cutting changes](#cross-cutting-changes)
 - [Known limitations and open items](#known-limitations-and-open-items)
 
@@ -47,6 +48,7 @@ What it could not do was serve as a real on-device engine:
 | 0.5.0 | Edge memory | INT8 / INT4 quantization, dequantizing kernels, QLoRA, compact model files, lazy gradients | 65 |
 | 1.0.0 | Production | Java 17 / Android readiness, Compose sample app, Dokka docs, Maven Central pipeline, JMH suite, CI | 66 |
 | 1.1.0 | Training efficiency | Loss masking, fused output-layer loss, frozen-weight backpropagation, matmul backward without copies, Vector API kernels, batch telemetry | 78 |
+| 1.2.0 | Low-memory inference | Buffered prompt prefill, `noGrad`, memory-mapped model files, embeddings tied to the output head, parallel attention, a reworked single-row quantized kernel with a per-VM INT4 default, configurable threads, sampling, prompt prefix reuse, Android 7 support | 124 |
 
 ## How the work was verified
 
@@ -59,6 +61,8 @@ Every change was held to the same rule: a new code path must reproduce a trusted
 The development environment could not download Gradle's distribution, the Gradle plugin portal or Maven Central, so the code was compiled with the standalone Kotlin 2.3.20 compiler and the test suites were run with a small reflection-based runner. The same test classes run under `./gradlew test`; you confirmed the Gradle run passed after milestone 2. The Gradle build scripts, the Android build and the GitHub workflows added in v1.0.0 could only be checked against official documentation, not executed — see [Known limitations](#known-limitations-and-open-items).
 
 v1.1.0 was held to the same rules: every fast path is compared with the computation it replaces (the fused loss with `Linear` plus `crossEntropyLoss`, frozen training with unfrozen training, the new kernels with a naive product, the Vector API kernels with the scalar ones). The development environment still could not reach Gradle's repositories, so the library was compiled with the standalone Kotlin 2.3.20 compiler, with the same flags as the build (`-Xjdk-release=17 -Xadd-modules=jdk.incubator.vector`), and the suite was run with the reflection runner twice — on the default scalar kernels and with `--add-modules jdk.incubator.vector` — and repeatedly, to rule out flaky allocation tests. The benchmark sources were compiled against stubs of the JMH annotations and every benchmark body run once, and a client compiled against the 1.0.0 classes was run against 1.1.0 to check binary compatibility. The timings come from hand-timed runs (one warm-up step, then the mean of three) on a 2-core container, so they show relative gains on that machine; the JMH suite is the tool for comparable numbers.
+
+v1.2.0 started from a failure on a phone, so it was checked against that failure. The model that ran out of memory in the Android app — an INT4 Qwen2-0.5B fine-tune, with its tokenizer and a chat prompt like the app's — was run on 1.1.0 under the same 512 MB heap limit (`-Xmx512m`, serial collector), where it failed in the same place, and then on 1.2.0 with heap loading, memory mapping and a tied re-export, comparing the generated tokens. Each new path is also compared with the one it replaces in the test suite: buffered prefill with the graph path at every chunk boundary, mapped tensors with heap tensors bit for bit, tied lookups with the head's dequantized values. The library was compiled with the standalone Kotlin 2.3.20 compiler and the build's flags, the suite was run with the reflection runner on the scalar kernels and with the Vector API module, and the 1.1.0 test classes were run unchanged against the 1.2.0 library to check binary compatibility. The benchmark and Android sample sources were not changed and were not rebuilt; `./gradlew test` and CI remain the checks of the Gradle build. Kernel variants were chosen with a microbenchmark under C2 and under C1 (no vectorization) as a stand-in for ART, which this environment cannot run; the Android 7 claim rests on an audit of every JDK method the compiled classes call, not on a run on an Android 7 device. The single-row kernel was later measured on a phone (a Helio G96 on Android 13, running ART): both INT4 inner loops, one and eight threads and the kernel before the rework generated the same 48 tokens from the app's model, and the INT4 default for Android was chosen from those timings.
 
 ---
 
@@ -635,6 +639,182 @@ The plan estimated 2.5–3.5 seconds per step for the full model once masking an
 
 ---
 
+## v1.2.0 — Low-memory inference
+
+An INT4 Qwen2-0.5B model fine-tuned with Kotensor (349 MiB of weights) failed in the Android app that ships it, during generation: `OutOfMemoryError: Failed to allocate a 1206288 byte allocation with 974864 free bytes and 952KB until OOM, target footprint 536870912, growth limit 536870912`. Android caps every app's Java heap — on that phone at 512 MB, the `android:largeHeap` maximum — and the engine exceeded it in two ways: generating a reply built a full training graph over the prompt, and the weights themselves were read into Java arrays. Version 1.2.0 fixes both and stores tied vocabulary matrices once. With memory no longer the limit, the time a reply takes became the next one, so the release also runs attention on every core, speeds up the single-row INT4 / INT8 kernel, lets generation reuse a cached system prompt, and runs on Android 7. Milestone 7 in [`Milestone.md`](Milestone.md) records the plan.
+
+### 1. Buffered prompt prefill
+
+**Files:** `Transformer.kt` (`prefill`, `generateStream`), `TransformerBlock.kt`, `Attention.kt`, `RoPE.kt` (`applyRowsInPlace`), `InferenceBuffers.kt`, `LoRA.kt`.
+
+**What changed.** `Transformer.prefill(prompt, cache, buffers)` runs a prompt through the model in chunks of 32 tokens (`MatMul.TILE_M`) using a small set of reusable buffers, appends the keys and values to the cache, and computes the final norm and the output layer for the last token only, into `buffers.logits`. `generate`, `generateStream` and `StreamingSession` now prefill with it. `RoPE.applyRowsInPlace(rows, startPosition)` rotates several tokens in place, and `LoRALinear.forwardInto` accepts several rows (one row still allocates nothing).
+
+**Why it was needed.** In 1.1.0 the prompt went through `forward(prompt, cache)`, the graph path. Every operation's result kept references to its inputs — its `parents` and its backward closure, which for `silu` holds a second array of sigmoids — whether or not anything needed a gradient, so the activations of all 24 layers stayed reachable until the first decode step: seven `[tokens × 4,864]` and eight `[tokens × 896]` arrays per layer for Qwen2-0.5B, about 3.8 MB per prompt token, plus two `[tokens × 151,936]` logits arrays (1.2 MB per token) of which only the last row was read. The 62-token prompt in the app needed about 300 MB on top of the weights; the allocation that failed, 1,206,288 bytes, is exactly one `[62 × 4,864]` float array with its array header. The output layer also ran for every prompt token: 136 million multiply-adds per token, 28% of the prefill work, for logits that were thrown away.
+
+**How it works.** Each chunk's token embeddings are copied into a `[rows × dimension]` buffer, and every block runs norm, attention, residual, norm, SwiGLU and residual with `forwardInto` and in-place operations — the same steps as `decode`, on up to 32 rows, so the matmuls keep using the tiled kernel. `Attention` projects the chunk's queries, keys and values, rotates them by their absolute positions, appends the keys and values to the cache and attends causally over everything cached so far, reusing `InferenceBuffers.scores`. After the last chunk, only its last row goes through the final norm and the output layer. The chunk buffers take about 2 MB for Qwen2-0.5B, whatever the prompt length. Prefill runs inside `noGrad` (see 2), so a module without a buffered path frees its temporaries immediately.
+
+**What we looked for.** Last-token logits and cached keys and values equal to the graph path within 1 × 10⁻⁴ for prompts of 1, 2, 31, 32, 33, 64 and 70 tokens (every chunk boundary), on FP32, INT8 and INT4 models and with LoRA adapters attached; a prompt prefilled in two calls equal to one call; decode steps after prefill equal to the graph path; `generate` producing the same tokens as greedy decoding through the graph path; mismatched caches and buffers rejected; and, measured with the thread allocation counter, prefill allocating under 1 KB per additional prompt token and less than a tenth of what the graph path allocates.
+
+### 2. No graph when nothing needs a gradient
+
+**Files:** `Tensor.kt` (`noGrad`), `Transformer.kt`.
+
+**What changed.** `noGrad { … }` runs a block without recording the autograd graph on the current thread: the results of operations inside it don't require a gradient and keep neither their inputs nor a backward closure. Outside `noGrad`, an operation whose inputs all have `requiresGrad = false` no longer keeps them either. `forward(indices, cache)` and `prefill` run inside `noGrad`. Leaf tensors created inside the block — parameters and inputs — still start with `requiresGrad = true`.
+
+**Why it was needed.** A result that doesn't require a gradient is never visited by `backward()`, but in 1.1.0 it still held its inputs, so any inference through the graph API — `model.forward(…)` to score text, or the cached forward — kept every intermediate alive for as long as the result was. That goes unnoticed in a 6 GB desktop heap and is fatal in a 512 MB Android one.
+
+**How it works.** The depth of nested `noGrad` blocks is a thread-local counter, restored even when the block throws. `Tensor`'s constructor computes `requiresGrad` as before while the counter is zero (and `false` otherwise) and keeps `parents` and `backwardOp` only when it is `true`; the two properties keep their names and types.
+
+**What we looked for.** Results inside `noGrad`, nested or not, have no parents and require no gradient while leaves still do; recording resumes after the block and after an exception, and `backward()` works afterwards; results of frozen operands keep no parents; the cached forward returns a graph-free result while the uncached forward still builds a graph; and every 1.1.0 training test passes unchanged.
+
+### 3. Memory-mapped model files
+
+**Files:** `QuantizedTensor.kt`, `MatMul.kt`, `SafeTensors.kt`, `Transformer.kt`.
+
+**What changed.** `Transformer.loadQuantized(file, memoryMapped = true)` maps the packed weights, scales and zero points of every quantized tensor from the file instead of copying them into Java arrays; only norm weights and biases — about 2 MB for Qwen2-0.5B — are read onto the heap. `QuantizedTensor.isMemoryMapped` tells which storage a tensor uses, and `SafeTensorsFile.map(name)` returns a read-only little-endian buffer over one tensor. `loadQuantized(file)` behaves as before.
+
+**Why it was needed.** On Android every Java array counts toward the app's heap limit, typically 256 to 512 MB with `largeHeap` regardless of the phone's RAM. A 349 MiB model left less than 160 MB for everything else, and phones with a lower limit could not load it at all. `ByteBuffer.allocateDirect` doesn't help there, because ART allocates direct buffers on the managed heap. A memory-mapped file lives in the page cache instead: the kernel reads its pages on first use and can drop them under memory pressure, and none of it counts toward the heap limit.
+
+**How it works.** `QuantizedTensor` now has two storages, heap arrays or mapped buffers, and allocates its heap arrays lazily, so constructing a model with `quantization` no longer allocates every weight before the file is mapped. The dequantizing kernels copy each row segment, scale row and zero-point row into their scratch arrays either with `System.arraycopy` or with a bulk `get` from a per-thread duplicate of the mapped buffers (created once per thread, so decoding a mapped model still allocates nothing), and the scalar accessors (`rawValue`, `value`, `dequantizeRow`) use absolute reads, which are thread-safe. Only `Buffer` methods that exist on every Android version are called: `position` through `java.nio.Buffer` and the relative bulk `get`. The `clear` and `limit` calls in the existing chunked `SafeTensorsFile` reader now go through `java.nio.Buffer` as well, because their `ByteBuffer`-returning overloads only exist from Java 9 and Android 14. The public `qdata`, `scales` and `zeros` arrays still work on a mapped tensor: the first access copies its data to the heap and the tensor stays there, so code that edits those arrays sees its edits used. `saveQuantized` reads mapped tensors without moving them.
+
+**What we looked for.** Heap-loaded and mapped models producing bit-identical logits through prefill, decode, `generate` and the batched forward pass, for INT8 and INT4; every scalar accessor agreeing; zero bytes allocated by 100 decode steps on a mapped model; a mapped model saved again reproducing the original file byte for byte and staying mapped; reading the arrays moving a tensor to the heap, after which edits take effect; and `map` returning the bytes `readRaw` reads.
+
+### 4. Embeddings tied to the output head
+
+**Files:** `Embedding.kt` (`TiedQuantizedEmbedding`), `QuantizedTensor.kt` (`dequantizeColumn`), `Transformer.kt` (`tieEmbeddingToHead`, `isEmbeddingTied`).
+
+**What changed.** `model.tieEmbeddingToHead()` replaces a quantized model's token embedding with a `TiedQuantizedEmbedding`, which reads token *t*'s vector from column *t* of the quantized `lmHead`. `saveQuantized` then writes no `embedding.*` tensors and records `kotensor.tiedEmbedding = true` in the metadata, and `loadQuantized` restores the tie, on the heap or mapped. Files without the flag load exactly as before.
+
+**Why it was needed.** Qwen2-0.5B, SmolLM2 and other small models share one matrix between the token embedding and the output layer (`tie_word_embeddings`). The importer copies it into `lmHead`, so `saveQuantized` stored it twice: 75 MiB each for Qwen2-0.5B.
+
+**How it works.** `lmHead` stores the matrix as `[dimension × vocabulary]`, so a token's vector is a column, read one quantized value per dimension; next to a decode step the cost is not measurable. `weightBytes` and `parameterCount` count the shared matrix once — for Qwen2-0.5B, 494,461,184 parameters, the model's published size.
+
+**Trade-off.** The two copies are quantized along different axes: each scale of the embedding table covers 64 tokens in one dimension, each scale of the head covers 64 dimensions of one token. On the model above, the head's step size is about 8% larger at the median, so a tied model's input embeddings are slightly coarser and greedy outputs can change: on the 367-token prompt the tied file produced the same eight tokens, on the 75-token prompt it diverged at the sixth. Tying is therefore opt-in, and a tied file should be checked on the model's own prompts before it ships.
+
+**What we looked for.** Tied lookups equal to the head's dequantized values through `forward` and `lookupInto`; weight bytes and parameters lower by exactly the embedding table; a tied file without `embedding.*` tensors that reproduces the same generation and logits when loaded on the heap or mapped; untied files still loading with their own embedding; tying rejected on a model whose head isn't quantized; and `dequantizeColumn` equal to `value`.
+
+### 5. Parallel attention
+
+**Files:** `Attention.kt`, `MatMul.kt` (`runsInParallel`, `parallelFor`).
+
+**What changed.** The cached attention of `prefill`, `decode` and `forward(indices, cache)` now runs through one routine that splits the work by head and query token over the matmul `ForkJoinPool`, and computes each query-key dot product with four independent partial sums.
+
+**Why it was needed.** Attention was the only single-threaded part of inference, and its cost grows with the square of the context: on the 2-core container, a 1,600-token prompt took 81 s against 30 s for 800 tokens, and each decoded token at that length took 0.27 s against 0.19 s at the start. Phones have more cores than that container, so the share lost to one core is larger there.
+
+**How it works.** Each (head, query token) pair is independent: it reads the cache and writes its own `headDim` slice of the context, so the pairs are distributed with the same tiling and the same `parallelThreshold` as the matmul. Below the threshold — every decode step on a short context — the loop stays serial and allocation-free; in parallel, each worker thread keeps its own growing score array. The four partial sums break the loop-carried dependency of the dot product, which the JIT does not vectorize.
+
+**What we looked for.** Prefill, decode and the cached forward produce identical results with the threshold at zero and at infinity, on FP32 and INT4 models, and so does `generate`; the zero-allocation decode tests still pass. On the Lecly model a 1,600-token prompt went from 81 s to 60 s, an 800-token prompt from 30.5 s to 24.1 s, and a decoded token at 1,600 positions from 0.27 s to 0.19 s.
+
+### 6. Single-row quantized kernel
+
+**Files:** `MatMul.kt`.
+
+**What changed.** The single-row (decode) INT4 / INT8 product was reworked in two steps. First, the kernel unpacks four weight rows and updates the accumulator once for all four, instead of once per row, and the high-nibble path writes straight into its destination. Then the whole single-row path was rebuilt around work units:
+
+- A matrix is cut into units that depend only on its shape: column blocks alone for matrices with 8,192 or more columns (the output head), and otherwise row ranges of whole 64-row groups combined with column blocks of at least 128 bytes.
+- Threads take units from a shared counter, so a fast core takes more units than a slow one. Below `parallelThreshold` the same units run on the calling thread.
+- A unit reads up to eight packed rows per bulk read and accumulates into 256-wide chunks; scales and zero points are applied once per group.
+- Two inner loops are available for INT4: *unpack* converts the packed weights to floats four rows at a time, and *lookup* builds a 64-entry table of `aᵢ · v` for every four rows and never converts a byte to a float.
+
+Multi-row (prefill) quantized tiles also narrow to 64–256 columns for matrices narrower than 12,288 columns, so 896-wide layers use every core.
+
+**Why it was needed.** Every decoded token runs this kernel over all 494 million weights. On the phone that started this milestone (two fast and six slow cores) a token took 1.5 s: the old kernel split a matrix into equal stripes of 256-column tiles, so an 896-wide matrix got at most four stripes and the key and value projections ran on one thread, a slow core held up every stripe split, and a mapped file was read in about 2.3 million small pieces per token.
+
+**How it works.** Row units write into per-unit partial rows that are added to the result in a fixed order, and both inner loops sum each column in the same order, so the result is bit-identical for any thread count, serial or parallel, and for unpack or lookup. On HotSpot the unpack loop is the fast one, because C2 vectorizes its zero-offset loops (a loop reading `src[offset + j]` was about 4× slower) and cannot vectorize the table lookup. On ART it is the other way round: byte-to-float conversion ran at 0.48 G elements/s per core on the test phone, about ten times slower than nibble extraction, and the lookup loop avoids it.
+
+**What we looked for.** The existing kernel tests (odd shapes, tails shorter than four rows, both bit widths, several group sizes, parallel against serial) and `DecodeKernelTest`: heap and mapped storage, lookup and unpack, one, three and four threads, INT4 with groups of 64 and 32, INT8, the column-split shape and accumulation with `alpha`, all bit for bit. Identical generated tokens on the Lecly model, on the JVM and on the phone. On the container a decoded token went from about 0.19 s to 0.15 s; the phone figures are in [Results](#12-results).
+
+### 7. Prompt prefix reuse
+
+**Files:** `KVCache.kt` (`copyFrom`, `PromptPrefix`), `Transformer.kt` (`cachePrefix`, `generate` / `generateStream` with a prefix).
+
+**What changed.** `model.cachePrefix(tokens)` runs a fixed opening — typically the system prompt — through the model once and keeps its keys and values in a `PromptPrefix`. `generate(prompt, maxTokens, stopTokens, prefix)` and `generateStream(…, prefix)` copy the cached positions that match the start of the prompt and prefill only the rest, with the same output as without the prefix. `KVCache.copyFrom(source, length)` copies the first positions of one cache into another.
+
+**Why it was needed.** A chat app sends the same system prompt with every message. In the Lecly app it is 50 of the 67 tokens of a first message, so most of the time to the first token went to recomputing it.
+
+**How it works.** `PromptPrefix.matchLength(prompt)` is the length of the common start of the cached tokens and the prompt, capped one token short of the prompt, because the last prompt token must be prefilled to produce the first logits. Matching by tokens, rather than trusting the caller, also handles tokenizers that merge the last token of the prefix with what follows — in Lecly, the system prompt's final `).` merges with a following `\n\n`, so 49 of its 50 tokens are reused when a passage follows. A prefix belongs to the `Transformer` that cached it, and the cache it holds is never modified.
+
+**What we looked for.** Generation with a prefix equal to generation without one for prompts that contain the whole prefix, part of it, none of it, or exactly it; repeated use leaving the prefix unchanged; `copyFrom` copying exact values and rejecting mismatched shapes and lengths; prefixes from another model rejected; and a prefix of three chunks matching a full prefill. On the Lecly model the first token of a first message went from 1.96 s to 0.54 s, and of a message with a passage and history from 5.9 s to 4.6 s.
+
+### 8. Android 7 compatibility
+
+**Files:** `MatMul.kt`, `Tensor.kt`.
+
+**What changed.** The two thread-locals are created by subclassing `ThreadLocal` instead of with `ThreadLocal.withInitial`.
+
+**Why it was needed.** `withInitial` exists only from Android 8.0 (API 26), so an app with a lower `minSdk` failed with `NoSuchMethodError` on Android 7 the first time it multiplied a matrix.
+
+**What we looked for.** Every JDK method the compiled library calls (outside the Vector API backend, which is never loaded on Android) was listed from the bytecode and checked: with `withInitial` gone, each is available from API 24, and the new memory-mapping code calls `position` through `java.nio.Buffer` because the `ByteBuffer` overloads only exist from Android 14.
+
+### 9. Thread count and INT4 kernel selection
+
+**Files:** `MatMul.kt`, `DecodeKernelTest.kt`.
+
+**What changed.** `MatMul.numThreads` can be set at runtime (it was fixed at start-up), and starts from the `kotensor.threads` system property when that is set, otherwise from the number of processors. `MatMul.lookupInt4` selects the INT4 inner loop of the single-row kernel: it defaults to lookup on Android, where the VM reports itself as Dalvik, and to unpack everywhere else. `-Dkotensor.int4Kernel=lookup` or `unpack` overrides the default, and the property can be changed at runtime.
+
+**Why it was needed.** The best inner loop depends on the VM (see section 6), and an app may want fewer threads than cores. Measured on the phone with the app's model, lookup with eight threads took 533–604 ms per token against 740–758 ms for unpack, and a single lookup thread (744–746 ms) matched eight unpack threads.
+
+**How it works.** Setting `numThreads` replaces the thread pool, which is created on first use. The default kernel comes from `java.vm.name`; both kernels give the same bits, so the choice changes speed only.
+
+**What we looked for.** Results equal for any thread count and after changing it at runtime; values below 1 rejected; the default decided from the property and the VM name; and the same token hash on the phone for unpack and lookup at one and eight threads.
+
+### 10. Sampling
+
+**Files:** new `Sampling.kt`; `Transformer.kt`, `StreamingSession.kt`; new `SamplingTest.kt`.
+
+**What changed.** `Sampling(temperature, topK, topP, repetitionPenalty, repetitionWindow, seed)` describes how the next token is chosen, and `generate`, `generateStream` and `StreamingSession.stream` have overloads that take one, with or without a prompt prefix. `Sampling.GREEDY` is the previous behavior, and the overloads without a `Sampling` are unchanged.
+
+**Why it was needed.** Generation was greedy only, which is repeatable but gives an app no way to vary its answers.
+
+**How it works.** A `Sampler` applies the repetition penalty (positive logits are divided by it, negative ones multiplied) to the distinct tokens among the last `repetitionWindow` tokens of the prompt and the generated text. It then takes the argmax if the settings are greedy, and otherwise keeps the `topK` most likely tokens, applies the temperature, cuts the tail at `topP` and draws one. Because the window covers the prompt, a short prompt is penalized as a whole, punctuation and stop tokens included; on a small fine-tuned model that was enough to derail answers, and the Lecly app went back to greedy decoding.
+
+**What we looked for.** `SamplingTest`: greedy settings match default generation, a seed repeats a run, top-k keeps the best candidates, top-p drops the tail, the penalty lowers recent tokens, invalid settings are rejected, and `StreamingSession` accepts a `Sampling`.
+
+### 11. Compatibility
+
+Version 1.2.0 is a drop-in replacement for 1.1.0, in source and in bytecode. Every public signature is kept: `loadQuantized(file)` stays as an overload next to `loadQuantized(file, memoryMapped)`, `Tensor.parents` / `backwardOp` and `QuantizedTensor.qdata` / `scales` / `zeros` keep their names and types, and the public `QuantizedTensor` constructor is unchanged. The 1.1.0 test classes ran unchanged against the 1.2.0 library. New API: `prefill`, `noGrad`, `loadQuantized(file, memoryMapped)`, `SafeTensorsFile.map`, `QuantizedTensor.isMemoryMapped` and `dequantizeColumn`, `tieEmbeddingToHead`, `isEmbeddingTied`, `TiedQuantizedEmbedding`, `RoPE.applyRowsInPlace`, `cachePrefix`, `PromptPrefix`, `KVCache.copyFrom`, `generate` / `generateStream` with a prefix, a settable `MatMul.numThreads`, `MatMul.lookupInt4`, `Sampling`, `Sampler`, and `generate` / `generateStream` / `StreamingSession.stream` with a `Sampling`.
+
+Behavior changes to be aware of: generation no longer goes through `forward(indices, cache)`; that method records no gradient (none ever reached the query, key and value projections through it, since the cached attention output had no backward pass); a result whose inputs are all frozen keeps no reference to them; reading `qdata`, `scales` or `zeros` of a mapped tensor copies the tensor onto the heap; and on Android the single-row INT4 kernel uses the lookup loop by default, with the same results.
+
+### 12. Results
+
+The model from the app — Qwen2-0.5B fine-tuned with LoRA and quantized to INT4, a 366 MB file — with its own tokenizer, generating eight tokens greedily from a 75-token chat prompt and from a 367-token prompt with retrieved context. JDK 21 with the serial collector on the same 2-core container; the model file was in the page cache.
+
+| | 1.1.0 | 1.2.0 | 1.2.0, mapped | 1.2.0, mapped and tied |
+| :-- | --: | --: | --: | --: |
+| Heap limit | out of memory at 512 MB | 512 MB | 128 MB | 128 MB |
+| Heap held by the model after loading | 350 MB | 350 MB | 3 MB | 3 MB |
+| Load time | 0.6 s | 0.6 s | 0.1 s | 0.1 s |
+| First token, 75-token prompt | 5.2 s | 2.6 s | 2.9 s | 3.2 s |
+| First token, 367-token prompt | 24.0 s | 10.3 s | 11.3 s | 10.5 s |
+| Each decoded token | 0.19 s | 0.15 s | 0.15 s | 0.15 s |
+| File size | 366 MB | 366 MB | 366 MB | 288 MB |
+
+With a 3 GB heap, 1.1.0 kept 605 MB live after garbage collection on the 75-token prompt and 1.7 GB on the 367-token one, against 387 MB on both prompts for 1.2.0 on the heap — the weights, the tokenizer and nothing that grows with the prompt. 1.1.0, 1.2.0 and 1.2.0 mapped generated the same tokens on both prompts. A mapped model reads its file on first use: the first answer after the file has left the page cache includes reading it from storage (22.7 s instead of 3.2 s on this container's slow disk; phone flash reads a few hundred MB per second).
+
+Longer prompts, memory-mapped, in a 256 MB heap:
+
+| Prompt | First token, before parallel attention | First token, 1.2.0 | Each decoded token, 1.2.0 |
+| :-- | --: | --: | --: |
+| 800 tokens | 30.5 s | 24.1 s | 0.17 s |
+| 1,600 tokens | 81.2 s | 60.1 s | 0.19 s |
+
+The heap stays at 43 MB plus the KV cache, 24 KB per token of context for this model (39 MB at 1,600 tokens). A full Lecly turn — its own prompt format, up to 96 generated tokens — starts answering in 0.54 s for a first message with the system prompt reused (1.96 s without) and in 4.6 s with a retrieved passage and two history messages (5.9 s without); producing the full reply takes about 15 s, so streaming it as it is generated matters more than any further change to the prefill. These are HotSpot figures; the heap accounting is the same on ART.
+
+On a phone — a Xiaomi Redmi Note 11 Pro 4G (MediaTek Helio G96: two Cortex-A76 and six Cortex-A55 cores, Android 13) — the same model generated 48 tokens greedily from the app's "hola" chat prompt with its 50-token system prompt cached, run twice from a command-line harness (`app_process`, not compiled ahead of time):
+
+| Engine | Kernel, threads | ms per decoded token |
+| :-- | :-- | --: |
+| Single-row kernel before the 1.2.0 rework | 8 | 2,107–2,139 |
+| 1.2.0 | unpack, 8 | 740–758 |
+| 1.2.0 | lookup, 8 (the Android default) | 533–604 |
+| 1.2.0 | unpack, 1 | 1,362–1,379 |
+| 1.2.0 | lookup, 1 | 744–746 |
+
+Every row generated the same 48 tokens. With eight threads the reworked kernel is 2.8–2.9× faster than before with the unpack loop and 3.5–4.0× with the lookup loop, which is the default on Android. Inside the Lecly app, compiled ahead of time, a decoded token takes 0.43–0.58 s with the lookup default (0.64–0.68 s with unpack, and 1.54 s before the rework); the engine loads in about 7 s with the system prompt cached, and the first token of a reply arrives 2 to 4 s after the message is sent.
+
+---
+
 ## Cross-cutting changes
 
 ### Documentation
@@ -643,14 +823,15 @@ The plan estimated 2.5–3.5 seconds per step for the full model once masking an
 - `Milestone.md` records the status of each milestone and how it was delivered.
 - `Module.md` (new) is the Dokka overview page, and this file is new.
 - For v1.1.0 the README gained sections on freezing, loss masking, training efficiency (with the measurements) and the Vector API backend, its API, limitation, test and benchmark tables were updated, and `Milestone.md` and `Module.md` record the new milestone and APIs.
+- For v1.2.0 the README gained a low-memory inference section with the measurements, and its generation, quantization, API, limitation, test and release sections were updated; `Milestone.md` records Milestone 7 and `Module.md` the new APIs.
 
 ### Code style
 
-From milestone 3 on, the code is written without comments or KDoc, following the project's no-comments rule; the v1.1.0 code follows it too. Comments from earlier milestones were removed in your own clean-up pass, and later write-backs restored the comment-free versions wherever a file had been regenerated. The files on disk are comment-free throughout.
+From milestone 3 on, the code is written without comments or KDoc, following the project's no-comments rule; the v1.1.0 and v1.2.0 code follows it too. Comments from earlier milestones were removed in your own clean-up pass, and later write-backs restored the comment-free versions wherever a file had been regenerated. The files on disk are comment-free throughout.
 
 ### Versions and coordinates
 
-The version went 0.1.0 → 0.2.0 → 0.3.0 → 0.4.0 → 0.5.0 → 1.0.0 → 1.1.0. The Maven coordinates changed from `com.github.TSPstudio:kotensor` to `io.github.tspstudio:kotensor`. The spec originally named `io.kotensor:kotensor`; the GitHub namespace was chosen because it is verified through the GitHub account rather than a domain (see *Maven Central publishing* under v1.0.0).
+The version went 0.1.0 → 0.2.0 → 0.3.0 → 0.4.0 → 0.5.0 → 1.0.0 → 1.1.0 → 1.2.0. The Maven coordinates changed from `com.github.TSPstudio:kotensor` to `io.github.tspstudio:kotensor`. The spec originally named `io.kotensor:kotensor`; the GitHub namespace was chosen because it is verified through the GitHub account rather than a domain (see *Maven Central publishing* under v1.0.0).
 
 ### Test suite growth
 
@@ -668,21 +849,30 @@ The version went 0.1.0 → 0.2.0 → 0.3.0 → 0.4.0 → 0.5.0 → 1.0.0 → 1.1
 | `HuggingFaceImportTest` | 7 | 0.4.0 | NumPy-reference logits, shards, biases, tied heads, dtypes, errors |
 | `QuantizationTest` | 11 | 0.5.0 | Error bounds, kernels, model paths, QLoRA, round trips, memory |
 | `TrainingTest` | 12 | 1.1.0 | Loss masking, fused loss, freezing and early termination, transposed kernels, Vector API vs scalar, data loading, telemetry |
-| **Total** | **78** | | |
+| `PrefillTest` | 14 | 1.2.0 | Buffered prefill equals the graph path at chunk boundaries, quantized and with LoRA; generation; prefill memory; `noGrad`; graph-free cached forward |
+| `MappedModelTest` | 12 | 1.2.0 | Mapped equals heap bit for bit, zero-allocation mapped decode, save round trip, moving to the heap, `map`, tied embeddings |
+| `PromptPrefixTest` | 7 | 1.2.0 | Generation with a prefix equals generation without, reuse, `matchLength`, `copyFrom`, ownership |
+| `ParallelAttentionTest` | 2 | 1.2.0 | Parallel attention and generation equal serial |
+| `SamplingTest` | 7 | 1.2.0 | Greedy equality, seeded runs, top-k, top-p, repetition penalty, validation, streaming |
+| `DecodeKernelTest` | 4 | 1.2.0 | Unpack and lookup single-row kernels bit for bit on heap and mapped weights, accumulation, runtime thread changes, the per-VM INT4 default |
+| **Total** | **124** | | |
 
 ---
 
 ## Known limitations and open items
 
-**Build and release.** v1.0.0 was built, tested and published to Maven Central by the GitHub workflows. v1.1.0 adds `-Xadd-modules=jdk.incubator.vector` to the compiler options and a `vectorApiTest` task that `./gradlew test` runs after the regular tests, so CI and the release workflow check both backends.
+**Build and release.** v1.0.0 was built, tested and published to Maven Central by the GitHub workflows. v1.1.0 adds `-Xadd-modules=jdk.incubator.vector` to the compiler options and a `vectorApiTest` task that `./gradlew test` runs after the regular tests, so CI and the release workflow check both backends. v1.2.0 changes no build file other than the version.
 
 **Engine limitations that remain:**
 
-- Greedy decoding only; there is no temperature or top-k / top-p sampling.
+- The repetition penalty of `Sampling` covers the prompt tokens inside its window as well as the generated ones; there is no option to penalize generated tokens only.
 - Quantization is round-to-nearest per group, without calibration (GPTQ / AWQ), and GGUF files are not read.
 - LoRA covers the query and value projections only, in all blocks or a chosen subset.
 - Loss masking applies to the loss: attention still sees masked tokens, and examples packed into one sequence can attend to earlier examples.
 - The Vector API backend needs `--add-modules jdk.incubator.vector` on JDK 17+, because the module is still incubating; Android always runs the scalar kernels.
 - The tokenizer handles byte-level BPE; SentencePiece-style tokenizers (Llama 2, Mistral) and pre-tokenizers other than `Split` and `ByteLevel` (such as `Digits`) are not supported.
 - The importer accepts the `llama`, `qwen2` and `mistral` architectures, and rejects others rather than guessing.
-- Performance was tuned on HotSpot; on Android, ART compiles the same code differently, so phone throughput should be measured with the sample app.
+- Memory mapping covers quantized model files; FP32 checkpoints and Hugging Face imports are read onto the heap, and so is the tokenizer. On Windows a mapped file can't be deleted or replaced while a model still maps it.
+- A tied embedding uses the output head's quantization, which is slightly coarser for input embeddings than a separate table.
+- Attention runs in parallel but in scalar loops; a prompt prefix is reused only where it matches the start of the prompt, so text that changes at the start (a retrieved passage placed first, for example) is recomputed every time.
+- Performance was tuned on HotSpot and measured on one phone (see the v1.2.0 results); other chips and Android versions may differ, so measure with the sample app. In the command-line harness, prompt prefill on that phone was slower with eight threads than with one; that has not been checked inside an app.

@@ -77,7 +77,7 @@ class Transformer(
         return KVCache(numLayers, numKeyValueHeads, maxSequenceLength, headDim)
     }
 
-    fun forward(indices: IntArray, cache: KVCache): Tensor {
+    fun forward(indices: IntArray, cache: KVCache): Tensor = noGrad {
         require(indices.isNotEmpty()) { "Input cannot be empty" }
         require(cache.numLayers == numLayers) { "Cache built for ${cache.numLayers} layers, model has $numLayers" }
         require(cache.remaining >= indices.size) {
@@ -89,11 +89,53 @@ class Transformer(
         }
         cache.advance(indices.size)
         val normed = finalNorm(x)
-        return lmHead(normed)
+        lmHead(normed)
     }
 
     fun newInferenceBuffers(maxSequenceLength: Int): InferenceBuffers {
         return InferenceBuffers(dimension, hiddenDimension, vocabularySize, maxSequenceLength, numKeyValueHeads * headDim)
+    }
+
+    fun prefill(prompt: IntArray, cache: KVCache, buffers: InferenceBuffers): Tensor = noGrad {
+        require(prompt.isNotEmpty()) { "Prompt cannot be empty" }
+        require(cache.numLayers == numLayers) { "Cache built for ${cache.numLayers} layers, model has $numLayers" }
+        require(cache.remaining >= prompt.size) {
+            "KV cache full: ${cache.length} + ${prompt.size} positions exceed maxSequenceLength ${cache.maxSequenceLength}"
+        }
+        require(buffers.dimension == dimension && buffers.hiddenDimension == hiddenDimension && buffers.vocabularySize == vocabularySize && buffers.kvDimension == numKeyValueHeads * headDim) {
+            "InferenceBuffers built for another model configuration"
+        }
+        require(buffers.scores.size >= cache.length + prompt.size) {
+            "InferenceBuffers sized for ${buffers.scores.size} positions, prompt ends at ${cache.length + prompt.size}"
+        }
+        val chunk = prefillLayers(prompt, cache, buffers.scores)
+        System.arraycopy(chunk.x.data, (chunk.rows - 1) * dimension, buffers.x.data, 0, dimension)
+        finalNorm.forwardInto(buffers.x, buffers.normed)
+        lmHead.forwardInto(buffers.normed, buffers.logits)
+    }
+
+    private fun prefillLayers(prompt: IntArray, cache: KVCache, scores: FloatArray): PrefillBuffers {
+        val kvDimension = numKeyValueHeads * headDim
+        var chunk = PrefillBuffers(minOf(MatMul.TILE_M, prompt.size), dimension, hiddenDimension, kvDimension)
+        var start = 0
+        while (start < prompt.size) {
+            val count = minOf(chunk.rows, prompt.size - start)
+            if (count != chunk.rows) chunk = PrefillBuffers(count, dimension, hiddenDimension, kvDimension)
+            chunk.x.copyFrom(embedding.forward(prompt.copyOfRange(start, start + count)))
+            for (l in blocks.indices) {
+                blocks[l].prefillInto(chunk.x, cache, l, chunk, scores)
+            }
+            cache.advance(count)
+            start += count
+        }
+        return chunk
+    }
+
+    fun cachePrefix(tokens: IntArray): PromptPrefix = noGrad {
+        require(tokens.isNotEmpty()) { "Prefix cannot be empty" }
+        val cache = newCache(tokens.size)
+        prefillLayers(tokens, cache, FloatArray(tokens.size))
+        PromptPrefix(this, tokens, cache)
     }
 
     fun decode(token: Int, cache: KVCache, buffers: InferenceBuffers): Tensor {
@@ -140,19 +182,52 @@ class Transformer(
         return tokenizer.decode(generatedTokens)
     }
 
-    fun generateStream(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int> = emptySet()): Sequence<Int> = sequence {
+    fun generateStream(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int> = emptySet()): Sequence<Int> = streamFrom(prompt, maxTokens, stopTokens, null, null)
+
+    fun generateStream(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, prefix: PromptPrefix): Sequence<Int> = streamFrom(prompt, maxTokens, stopTokens, prefix, null)
+
+    fun generateStream(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, sampling: Sampling): Sequence<Int> = streamFrom(prompt, maxTokens, stopTokens, null, sampling)
+
+    fun generateStream(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, prefix: PromptPrefix, sampling: Sampling): Sequence<Int> = streamFrom(prompt, maxTokens, stopTokens, prefix, sampling)
+
+    fun generate(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, prefix: PromptPrefix): IntArray = collect(prompt, maxTokens, streamFrom(prompt, maxTokens, stopTokens, prefix, null))
+
+    fun generate(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, sampling: Sampling): IntArray = collect(prompt, maxTokens, streamFrom(prompt, maxTokens, stopTokens, null, sampling))
+
+    fun generate(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, prefix: PromptPrefix, sampling: Sampling): IntArray = collect(prompt, maxTokens, streamFrom(prompt, maxTokens, stopTokens, prefix, sampling))
+
+    private fun collect(prompt: IntArray, maxTokens: Int, stream: Sequence<Int>): IntArray {
         require(prompt.isNotEmpty()) { "Prompt cannot be empty" }
+        val tokens = IntArray(prompt.size + maxOf(0, maxTokens))
+        prompt.copyInto(tokens)
+        var count = prompt.size
+        for (token in stream) {
+            tokens[count] = token
+            count++
+        }
+        return tokens.copyOf(count)
+    }
+
+    private fun streamFrom(prompt: IntArray, maxTokens: Int, stopTokens: Set<Int>, prefix: PromptPrefix?, sampling: Sampling?): Sequence<Int> = sequence {
+        require(prompt.isNotEmpty()) { "Prompt cannot be empty" }
+        require(prefix == null || prefix.owner === this@Transformer) { "PromptPrefix was cached by another Transformer" }
         if (maxTokens <= 0) return@sequence
         val maxSequenceLength = prompt.size + maxTokens
         val cache = newCache(maxSequenceLength)
         val buffers = newInferenceBuffers(maxSequenceLength)
-        var logits = forward(prompt, cache)
+        val sampler = sampling?.newSampler(vocabularySize)
+        val history = if (sampler != null) prompt.copyOf(maxSequenceLength) else null
+        var historyLength = prompt.size
+        val reused = prefix?.matchLength(prompt) ?: 0
+        if (prefix != null) cache.copyFrom(prefix.cache, reused)
+        var logits = prefill(if (reused == 0) prompt else prompt.copyOfRange(reused, prompt.size), cache, buffers)
         for (step in 0 until maxTokens) {
-            val bestIndex = argmaxOfLastToken(logits)
-            if (bestIndex in stopTokens) break
-            yield(bestIndex)
+            val next = if (sampler != null) sampler.next(logits.data, history!!, historyLength) else argmaxOfLastToken(logits)
+            if (next in stopTokens) break
+            yield(next)
+            if (history != null) history[historyLength++] = next
             if (step == maxTokens - 1) break
-            logits = decode(bestIndex, cache, buffers)
+            logits = decode(next, cache, buffers)
         }
     }
 
@@ -299,6 +374,17 @@ class Transformer(
     val quantization: Quantization?
         get() = namedQuantizedLayers().values.firstOrNull()?.quantization
 
+    val isEmbeddingTied: Boolean
+        get() = embedding is TiedQuantizedEmbedding
+
+    fun tieEmbeddingToHead(): Transformer {
+        val head = lmHead as? QuantizedLinear
+            ?: throw IllegalStateException("Tying needs a quantized lmHead; quantize() the model first (lmHead is ${lmHead::class.simpleName})")
+        require(head.inSize == dimension && head.outSize == vocabularySize) { "lmHead is ${head.inSize} × ${head.outSize}, expected $dimension × $vocabularySize" }
+        embedding = TiedQuantizedEmbedding(head)
+        return this
+    }
+
     fun parameterCount(): Long {
         var count = 0L
         for (p in namedParameters().values) count += p.data.size
@@ -330,20 +416,23 @@ class Transformer(
         val q = quantization ?: throw IllegalStateException("No quantized layers to save; call quantize() first")
         metadata["kotensor.quantization.bits"] = q.bits.toString()
         metadata["kotensor.quantization.groupSize"] = q.groupSize.toString()
+        if (isEmbeddingTied) metadata["kotensor.tiedEmbedding"] = "true"
         for ((name, tensor) in namedParameters()) {
             entries.add(SafeTensorsEntry.of(name, tensor))
         }
         for ((name, weight) in namedQuantizedTensors()) {
             require(weight.bits == q.bits && weight.groupSize == q.groupSize) { "$name uses int${weight.bits}/g${weight.groupSize}, file uses $q" }
-            entries.add(SafeTensorsEntry("$name.qweight", if (q.bits == 8) "I8" else "U8", intArrayOf(weight.rows, weight.bytesPerRow), weight.qdata))
-            entries.add(SafeTensorsEntry.of("$name.scales", Tensor(weight.scales, intArrayOf(weight.groups, weight.columns))))
-            weight.zeros?.let { zeros -> entries.add(SafeTensorsEntry("$name.zeros", "U8", intArrayOf(weight.groups, weight.columns), zeros)) }
+            entries.add(SafeTensorsEntry("$name.qweight", if (q.bits == 8) "I8" else "U8", intArrayOf(weight.rows, weight.bytesPerRow), weight.qdataSnapshot()))
+            entries.add(SafeTensorsEntry.of("$name.scales", Tensor(weight.scalesSnapshot(), intArrayOf(weight.groups, weight.columns))))
+            weight.zerosSnapshot()?.let { zeros -> entries.add(SafeTensorsEntry("$name.zeros", "U8", intArrayOf(weight.groups, weight.columns), zeros)) }
         }
         SafeTensors.saveEntries(file, entries, metadata)
     }
 
     companion object {
-        fun loadQuantized(file: java.io.File): Transformer {
+        fun loadQuantized(file: java.io.File): Transformer = loadQuantized(file, memoryMapped = false)
+
+        fun loadQuantized(file: java.io.File, memoryMapped: Boolean): Transformer {
             SafeTensorsFile(file).use { reader ->
                 val meta = reader.metadata
                 fun value(key: String): String = meta[key] ?: throw IllegalArgumentException("$file has no $key metadata; was it written by saveQuantized?")
@@ -363,14 +452,19 @@ class Transformer(
                     ropeScaling = scaling,
                     quantization = quantization
                 )
+                if (meta["kotensor.tiedEmbedding"] == "true") model.tieEmbeddingToHead()
                 for ((name, tensor) in model.namedParameters()) {
                     require(name in reader) { "$file is missing $name" }
                     reader.readInto(name, tensor.data)
                 }
                 for ((name, weight) in model.namedQuantizedTensors()) {
-                    reader.readRaw("$name.qweight", weight.qdata)
-                    reader.readInto("$name.scales", weight.scales)
-                    weight.zeros?.let { zeros -> reader.readRaw("$name.zeros", zeros) }
+                    if (memoryMapped) {
+                        weight.mapFrom(reader, name)
+                    } else {
+                        reader.readRaw("$name.qweight", weight.qdata)
+                        reader.readInto("$name.scales", weight.scales)
+                        weight.zeros?.let { zeros -> reader.readRaw("$name.zeros", zeros) }
+                    }
                 }
                 return model
             }
